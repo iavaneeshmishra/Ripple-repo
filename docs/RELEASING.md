@@ -1,17 +1,18 @@
 # Releasing Ripple
 
-This runbook is the source of truth for producing Android and iOS build
-artifacts from the same tagged commit. The single tag-triggered workflow,
-`.github/workflows/release.yml`, builds the debug APK and unsigned iOS archive
-for every `v*` tag, and builds an Android release AAB for stable tags. Its sole
-`publish` job creates or updates the tag's GitHub Release; build jobs only
-upload workflow artifacts and have read-only permissions.
+This runbook is the source of truth for tagged Android releases. The single
+`.github/workflows/release.yml` workflow builds Android artifacts and also
+attempts an unsigned iOS archive as an independent workflow artifact. The iOS
+archive is not included in an Android release, is not signed or submitted, and
+its job does not gate Android publishing. The sole `publish` job creates or
+updates the tag's Android GitHub Release; Android build jobs only upload
+workflow artifacts and have read-only permissions.
 
-Prerelease Releases contain a clearly labeled debug APK for field testing. A
-stable release remains a draft until reviewed and contains either a Play
-upload-ready, upload-key-signed AAB or an explicitly unsigned, non-store-ready
-AAB. The unsigned iOS archive is always a workflow artifact, not an IPA or a
-GitHub Release asset. Store submission and iOS signing/export remain manual.
+Prerelease Releases contain a clearly labeled Android debug APK for field
+testing. A stable Android release remains a draft until reviewed and contains
+either a Play upload-ready, upload-key-signed AAB or an explicitly unsigned,
+non-store-ready AAB. The unsigned iOS archive is not an IPA or a GitHub Release
+asset. Google Play submission and iOS signing/export remain manual.
 
 Before using the workflow, protect the `v*` tag namespace with a repository
 ruleset that restricts tag creation and updates to release maintainers. Do not
@@ -19,20 +20,20 @@ dispatch a release build from an unreviewed branch.
 
 ## 1. Prepare one release commit
 
-Prerequisites are Node 22+, JDK 17, and (for iOS) macOS with Xcode 15.4+ and
-XcodeGen. A release also needs Google Play Console and Apple Developer/App Store
-Connect access.
+For an Android-only release, prerequisites are Node 22+, JDK 17, and Google
+Play Console access. The separate unsigned iOS archive job uses macOS/Xcode but
+needs no signing certificate; Apple signing and certification are only needed
+for a future iOS distribution.
 
 1. Start from a clean, reviewed `master` commit. Pick a SemVer tag such as
    `v1.0.1`.
 2. Set Android's monotonically increasing `versionCode` and user-visible
-   `versionName` in `android/app/build.gradle.kts`.
-3. Set the matching `CFBundleShortVersionString` and a monotonically increasing
-   `CFBundleVersion` in `ios/Ripple/Resources/Info.plist`.
-4. Refresh the iOS English catalog and prove the wire vectors are unchanged:
+   `versionName` in `android/app/build.gradle.kts`. For this release they are
+   `2` and `1.0.1`. Do not bump the iOS `Info.plist` version or build number;
+   this release does not distribute an iOS app.
+3. Run the release checks and prove all shared protocol vectors are unchanged:
 
    ```bash
-   node tools/i18n/extract-ios.js
    node tools/protocol/test.js                 # all protocol regression tests must pass
    node tools/release/test.js                   # dry-run stable/prerelease assets and notes
    node tools/protocol/gen-vectors.js
@@ -41,8 +42,8 @@ Connect access.
      ios/RippleTests/Resources/test-vectors.json
    ```
 
-5. Merge the version PR only after the protocol, Android, and iOS CI jobs are
-   green. On the resulting `master`, record the exact commit and tag it:
+4. Merge the version PR only after the required CI checks are green. On the
+   resulting `master`, record the exact commit and tag it:
 
    ```bash
    git pull --ff-only origin master
@@ -52,25 +53,29 @@ Connect access.
    ```
 
 For every `v*` tag, `.github/workflows/release.yml` runs protocol conformance
-and release-payload dry-run tests, builds the Android debug APK and unsigned iOS
-archive, then uploads those as workflow artifacts. Stable tags (no hyphen) also
-build an Android release AAB. The only job with `contents: write` is `publish`;
-it validates checksums, constructs the release notes and exact public asset set,
-then creates or updates the GitHub Release, prunes stale attachments, and verifies
-the final release notes and exact remote asset list.
+and release-payload dry-run tests, then builds the Android debug APK. Stable tags
+(no hyphen) also build an Android release AAB. The unsigned iOS archive is built
+in a separate job and may be uploaded as a workflow artifact, but it is neither
+included in the Android release nor a dependency of the publisher. The only job
+with `contents: write` is `publish`; it waits for protocol and Android builds,
+validates checksums, constructs the Android release notes and exact public asset
+set, then creates or updates the GitHub Release, prunes stale attachments, and
+verifies the final release notes and exact remote asset list.
 
 - **Prerelease tag** (for example, `v1.0.1-rc.1`): publish the debug APK,
   `SHA256SUMS`, `ARTIFACT-NOTICE.txt`, and `RELEASING.md` as a prerelease. The
-  APK is for testing only, not store-ready. The unsigned iOS archive is a
-  workflow artifact and is not an `.ipa` or a release asset.
+  APK is for testing only, not store-ready. An unsigned iOS archive may be
+  uploaded independently as a workflow artifact if its build succeeds; it is
+  not an `.ipa` or a release asset.
 - **Stable tag** (for example, `v1.0.1`): create or update a **draft** release
   with one AAB, its `SHA256SUMS`, `SIGNING-NOTICE.txt`, and `RELEASING.md`. With
   all four Android signing secrets configured, the asset is named
   `ripple-<tag>-store-ready.aab` and is signed with the Play upload key. With no
   secrets, it is `ripple-<tag>-unsigned.aab` and the notice and release notes
   explicitly say not to upload it to Play. A partial signing configuration
-  fails the build. The debug APK, iOS archive, and R8 mapping file remain
-  workflow artifacts; the mapping file is never attached to the public release.
+  fails the build. The debug APK, an iOS archive if its independent job succeeds,
+  and the R8 mapping file remain workflow artifacts; the iOS archive and mapping
+  file are never attached to the public release.
 
 A rerun may replace assets only on a draft stable release; the workflow refuses
 to alter an already-published stable release. A prerelease tag creates a

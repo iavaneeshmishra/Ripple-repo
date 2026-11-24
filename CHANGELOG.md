@@ -3,6 +3,29 @@
 All notable changes to Ripple are documented here.  Format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.1] — 2026-11-24
+
+Android-only release (versionCode 2). The iOS app is not included in this release
+while distribution certification is pending.
+
+### Added
+
+- **Guided field testing** — structured diagnostic export for field reports.
+- **Safer identity exchange** — QR identity codes, 12-digit safety codes, and
+  verified-peer pinning (manual QR display; no camera permission).
+- **Encrypted identity backup** — passphrase-protected backup and restore that
+  preserves the node ID across reinstall.
+- **Accessibility and notifications** — notification deep links, unread badges,
+  and improved screen-reader labels.
+
+### Improved
+
+- Hardened packet validation, replay protection, fragmentation limits, and
+  Bluetooth/store-and-forward reliability. The wire protocol remains compatible
+  with v1.0.0; queued messages expire after 72 hours.
+- Kept release builds internet-free; the Android app does not request the
+  `INTERNET` permission.
+
 ## [1.0.0] — 2026-09-07
 
 First stable release.  Internet-free, phone-to-phone encrypted messaging over
