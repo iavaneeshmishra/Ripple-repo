@@ -176,7 +176,7 @@ class MeshRouterTest {
         val b = Node("B", net, clock = { now })
         link(a, b); net.settle()
 
-        val packet = PacketFactory.directText(a.router.identity, b.router.selfId, a.router.identity.publicKeyWire, "replay window")
+        val packet = PacketFactory.directText(a.router.identity, b.router.selfId, b.router.identity.publicKeyWire, "replay window")
         val bytes = packet.encode()
         val linkFromA = b.links.first { it.remote === a }
         b.router.onReceive(linkFromA, bytes); net.settle()
