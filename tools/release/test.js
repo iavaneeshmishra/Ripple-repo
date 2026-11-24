@@ -65,7 +65,8 @@ function testSignedStableBundle() {
   assert.match(notes, /signed with the configured Ripple Google Play upload key/);
   assert.match(notes, /workflow run/);
   assert.match(notes, /debug APK[\s\S]*field testing/);
-  assert.match(notes, /unsigned.*Ripple\.xcarchive/i);
+  assert.match(notes, /Android-only release/);
+  assert.match(notes, /unsigned iOS archive may be uploaded separately as a workflow artifact/i);
   assert.doesNotMatch(notes, /not store-ready/);
   fs.rmSync(fixture.root, { recursive: true, force: true });
 }
@@ -98,7 +99,7 @@ function testPrereleaseDebugApk() {
   const notes = fs.readFileSync(fixture.notesFile, 'utf8');
   assert.match(notes, /Pre-release for field testing/);
   assert.match(notes, /debug-signed APK[\s\S]*not store-ready/);
-  assert.match(notes, /not an IPA/);
+  assert.match(notes, /unsigned iOS archive may be uploaded separately as a workflow artifact/i);
   assert.equal(fixture.manifest.assets.length, 4);
   assert.equal(fixture.manifest.assets.some((asset) => asset.name.endsWith('.aab')), false);
   fs.rmSync(fixture.root, { recursive: true, force: true });
