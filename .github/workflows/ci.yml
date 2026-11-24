@@ -62,9 +62,45 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "$BUILD_OUTCOME" != "success" && -f gradle.log ]]; then
-            while IFS= read -r line; do
-              [[ -z "$line" ]] || printf '::error title=Android Gradle log tail::%s\n' "${line:0:900}"
-            done < <(tail -n 50 gradle.log)
+            diagnostics="$(python3 - <<'PY'
+          import glob
+          import re
+          import xml.etree.ElementTree as ET
+
+          lines = open("gradle.log", encoding="utf-8", errors="replace").read().splitlines()
+          failure = next((i for i, line in enumerate(lines) if line.startswith("FAILURE: Build failed")), None)
+          if failure is not None:
+              print("\n".join(lines[failure:failure + 70]))
+          else:
+              hits = [i for i, line in enumerate(lines) if re.search(r"(^e: |error:|FAILED|Execution failed|What went wrong|Caused by:|AssertionError|ComparisonFailure)", line)]
+              if hits:
+                  selected = set()
+                  for i in hits[-12:]:
+                      selected.update(range(max(0, i - 1), min(len(lines), i + 5)))
+                  print("\n".join(lines[i] for i in sorted(selected)))
+              else:
+                  print("\n".join(lines[-50:]))
+
+          for report in sorted(glob.glob("app/build/test-results/testDebugUnitTest/TEST-*.xml")):
+              try:
+                  root = ET.parse(report).getroot()
+              except (ET.ParseError, OSError) as error:
+                  print(f"Could not parse {report}: {error}")
+                  continue
+              for case in root.iter("testcase"):
+                  for failure_node in list(case.findall("failure")) + list(case.findall("error")):
+                      detail = (failure_node.attrib.get("message", "") + "\n" + (failure_node.text or "")).strip()
+                      print(f"{case.attrib.get('classname', '')}.{case.attrib.get('name', '')}: {detail[:2500]}")
+          PY
+            )"
+            if [[ -n "$diagnostics" ]]; then
+              diagnostics="${diagnostics:0:8000}"
+              escaped=${diagnostics//%/%25}
+              escaped=${escaped//$'\r'/%0D}
+              escaped=${escaped//$'\n'/%0A}
+              printf '::error title=Android build/test details::%s\n' "$escaped"
+              printf '%s\n' "$diagnostics" >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
       - uses: actions/upload-artifact@v6
         if: always()
