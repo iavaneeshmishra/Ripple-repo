@@ -1,20 +1,48 @@
-name: Android release
+name: Tagged builds and release publishing
 
 on:
   workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
+# Build jobs are read-only. The single publish job below owns tag Releases.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  android-release:
-    name: Android release AAB
+  protocol:
+    name: Protocol conformance + release-payload tests
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Protocol regression tests
+        run: node tools/protocol/test.js
+      - name: Release payload dry-run tests
+        run: node tools/release/test.js
+      - name: Vectors are up to date
+        run: |
+          node tools/protocol/gen-vectors.js && git diff --exit-code protocol/test-vectors.json
+          cmp protocol/test-vectors.json android/app/src/test/resources/test-vectors.json
+          cmp protocol/test-vectors.json ios/RippleTests/Resources/test-vectors.json
+
+  android:
+    name: Android debug APK and release AAB
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    needs: protocol
+    outputs:
+      bundle_status: ${{ steps.signing.outputs.label }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-java@v5
         with:
@@ -23,8 +51,46 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v5
 
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --console=plain
+
+      - name: Stage debug APK and notice
+        working-directory: android
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/debug/*.apk)
+          if [[ "${#apks[@]}" -ne 1 ]]; then
+            echo "Expected exactly one debug APK, found ${#apks[@]}." >&2
+            exit 1
+          fi
+          safe_tag="${TAG//\//-}"
+          mkdir -p release-artifacts/debug
+          apk_name="ripple-${safe_tag}-debug.apk"
+          cp "${apks[0]}" "release-artifacts/debug/${apk_name}"
+          cp ../docs/RELEASING.md release-artifacts/debug/RELEASING.md
+          cat > release-artifacts/debug/ARTIFACT-NOTICE.txt <<'NOTICE'
+          DEBUG-SIGNED APK — for field testing and sideloading only.
+          This is not store-ready and is not suitable for upgrading a Play-signed installation.
+          See RELEASING.md for the distinction between test and store artifacts.
+          NOTICE
+          (
+            cd release-artifacts/debug
+            sha256sum "$apk_name" > SHA256SUMS
+          )
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ripple-android-debug
+          path: android/release-artifacts/debug/
+          if-no-files-found: error
+
       - name: Configure signing when all secrets are present
         id: signing
+        if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && !contains(github.ref_name, '-'))
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -41,7 +107,7 @@ jobs:
           if [[ "$present" -eq 0 ]]; then
             echo "signed=false" >> "$GITHUB_OUTPUT"
             echo "label=unsigned" >> "$GITHUB_OUTPUT"
-            echo "No Android signing secrets found; building the documented unsigned AAB."
+            echo "No Android signing secrets found; the bundle will be explicitly labeled unsigned and not store-ready."
           elif [[ "$present" -ne 4 ]]; then
             echo "Signing is only safe when all four Android secrets are configured." >&2
             exit 1
@@ -56,22 +122,17 @@ jobs:
               echo "RIPPLE_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
             } >> "$GITHUB_ENV"
             echo "signed=true" >> "$GITHUB_OUTPUT"
-            echo "label=signed" >> "$GITHUB_OUTPUT"
-            echo "Complete signing configuration found; the AAB will be signed."
-          fi
-
-      - name: Bootstrap Gradle wrapper
-        working-directory: android
-        run: |
-          if [[ ! -f gradlew ]]; then
-            gradle wrapper --gradle-version 8.9 --no-daemon
+            echo "label=store-ready" >> "$GITHUB_OUTPUT"
+            echo "Complete signing configuration found; the AAB will be signed with the configured Play upload key."
           fi
 
       - name: Build release bundle
+        if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && !contains(github.ref_name, '-'))
         working-directory: android
         run: ./gradlew bundleRelease --no-daemon --console=plain
 
-      - name: Verify merged manifest has no INTERNET permission
+      - name: Verify merged release manifest has no INTERNET permission
+        if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && !contains(github.ref_name, '-'))
         working-directory: android
         run: |
           set -euo pipefail
@@ -88,12 +149,13 @@ jobs:
           done
           echo "Verified ${#manifests[@]} merged release manifest(s): no INTERNET permission."
 
-      - name: Package release artifacts and signing instructions
-        id: package
+      - name: Stage release AAB and signing notice
+        if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && !contains(github.ref_name, '-'))
         working-directory: android
         env:
           SIGNED: ${{ steps.signing.outputs.signed }}
           LABEL: ${{ steps.signing.outputs.label }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -102,48 +164,225 @@ jobs:
             echo "Expected exactly one release AAB, found ${#bundles[@]}." >&2
             exit 1
           fi
-          safe_ref="${GITHUB_REF_NAME//\//-}"
-          mkdir -p release-artifacts
-          aab="release-artifacts/ripple-${safe_ref}-${LABEL}.aab"
-          cp "${bundles[0]}" "$aab"
-          cp ../docs/RELEASING.md release-artifacts/RELEASING.md
+          safe_tag="${TAG//\//-}"
+          mkdir -p release-artifacts/bundle
+          aab="ripple-${safe_tag}-${LABEL}.aab"
+          cp "${bundles[0]}" "release-artifacts/bundle/${aab}"
+          cp ../docs/RELEASING.md release-artifacts/bundle/RELEASING.md
           if [[ "$SIGNED" == "true" ]]; then
-            jarsigner -verify "$aab"
-            cat > release-artifacts/SIGNING-NOTICE.txt <<'NOTICE'
-          This AAB was signed by GitHub Actions with the configured Ripple upload key.
-          Verify the tag, workflow run, and certificate before uploading it.
-          See RELEASING.md for the Play internal-track procedure.
+            jarsigner -verify "release-artifacts/bundle/${aab}"
+            cat > release-artifacts/bundle/SIGNING-NOTICE.txt <<'NOTICE'
+          STORE-UPLOAD-READY AAB — signed by GitHub Actions with the configured Ripple Google Play upload key.
+          Verify the tag, workflow run, checksum, version, and signing certificate before submitting it to Play Console.
+          This is an Android App Bundle; Google Play generates installable APKs after processing it.
           NOTICE
           else
-            cat > release-artifacts/SIGNING-NOTICE.txt <<'NOTICE'
-          UNSIGNED AAB — do not upload this file to Google Play.
-          Configure all four Android repository secrets and rerun this workflow,
+            cat > release-artifacts/bundle/SIGNING-NOTICE.txt <<'NOTICE'
+          UNSIGNED AAB — not store-ready. Do not upload this file to Google Play.
+          Configure all four Android repository secrets and rerun the tag workflow,
           or follow the local signing instructions in RELEASING.md.
           NOTICE
           fi
           mapping=app/build/outputs/mapping/release/mapping.txt
-          if [[ -f "$mapping" ]]; then cp "$mapping" release-artifacts/mapping.txt; fi
-          echo "aab_path=android/$aab" >> "$GITHUB_OUTPUT"
+          if [[ -f "$mapping" ]]; then cp "$mapping" release-artifacts/bundle/mapping.txt; fi
+          (
+            cd release-artifacts/bundle
+            sha256sum "$aab" > SHA256SUMS
+          )
 
       - uses: actions/upload-artifact@v6
+        if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && !contains(github.ref_name, '-'))
         with:
-          name: ripple-android-${{ github.ref_name }}-${{ steps.signing.outputs.label }}
-          path: android/release-artifacts/
+          name: ripple-android-bundle
+          path: android/release-artifacts/bundle/
           if-no-files-found: error
 
-      - name: Attach tag builds to a GitHub release
-        if: github.ref_type == 'tag'
+  ios:
+    name: iOS unsigned archive
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/master'
+    runs-on: macos-15
+    needs: protocol
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: brew install xcodegen
+      - name: Generate project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Build unsigned archive
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild archive -scheme Ripple -project Ripple.xcodeproj \
+            -destination "generic/platform=iOS" \
+            -archivePath "$PWD/Ripple.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            2>&1 | tee xcodebuild.log
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: ios-archive-log
+          path: ios/xcodebuild.log
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ripple-ios-archive
+          path: ios/Ripple.xcarchive
+          if-no-files-found: error
+
+  publish:
+    name: Create or update the tag release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    needs: [protocol, android, ios]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v6
+        if: contains(github.ref_name, '-')
+        with:
+          name: ripple-android-debug
+          path: artifacts/android-debug
+
+      - uses: actions/download-artifact@v6
+        if: ${{ !contains(github.ref_name, '-') }}
+        with:
+          name: ripple-android-bundle
+          path: artifacts/android-bundle
+
+      - name: Validate release assets and compose notes
         env:
-          GH_TOKEN: ${{ github.token }}
-          AAB_PATH: ${{ steps.package.outputs.aab_path }}
-          SIGNING_LABEL: ${{ steps.signing.outputs.label }}
+          TAG: ${{ github.ref_name }}
+          BUNDLE_STATUS: ${{ needs.android.outputs.bundle_status }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
-              --title "Ripple $GITHUB_REF_NAME" \
-              --notes "Android ${SIGNING_LABEL} release bundle produced from tagged commit $GITHUB_SHA. See the attached signing notice and docs/RELEASING.md."
+          if [[ "$TAG" == *-* ]]; then
+            channel=prerelease
+            source_dir=artifacts/android-debug
+            signing=none
+          else
+            channel=stable
+            source_dir=artifacts/android-bundle
+            signing="$BUNDLE_STATUS"
           fi
-          gh release upload "$GITHUB_REF_NAME" "$AAB_PATH" \
-            android/release-artifacts/SIGNING-NOTICE.txt \
-            android/release-artifacts/RELEASING.md --clobber
+          node tools/release/prepare-release.js \
+            --tag "$TAG" \
+            --channel "$channel" \
+            --signing "$signing" \
+            --repo "$REPOSITORY" \
+            --commit "$COMMIT" \
+            --run-id "$RUN_ID" \
+            --server-url "$SERVER_URL" \
+            --source-dir "$source_dir" \
+            --assets-dir release-assets \
+            --notes-file release-notes.md | tee release-manifest.json
+          {
+            echo "## Validated release payload: $TAG"
+            echo '```json'
+            cat release-manifest.json
+            echo '```'
+            echo "### Release notes"
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update release (sole publisher)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" == *-* ]]; then
+            channel=prerelease
+            title="Ripple $TAG"
+          else
+            channel=stable
+            title="Ripple $TAG"
+          fi
+
+          mapfile -t expected_assets < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ "${#expected_assets[@]}" -ne 4 ]]; then
+            echo "Expected exactly four validated public release assets, found ${#expected_assets[@]}." >&2
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            state=$(gh release view "$TAG" --json isDraft,isPrerelease)
+            is_draft=$(jq -r '.isDraft' <<<"$state")
+            is_prerelease=$(jq -r '.isPrerelease' <<<"$state")
+            if [[ "$channel" == "stable" ]]; then
+              if [[ "$is_draft" != "true" || "$is_prerelease" == "true" ]]; then
+                echo "Refusing to modify a published stable release or a pre-release; use a new tag for corrected assets." >&2
+                exit 1
+              fi
+              gh release edit "$TAG" --title "$title" --notes-file release-notes.md
+            else
+              if [[ "$is_draft" != "true" && "$is_prerelease" != "true" ]]; then
+                echo "Refusing to convert an already-published stable release into a pre-release." >&2
+                exit 1
+              fi
+              gh release edit "$TAG" --title "$title" --notes-file release-notes.md --draft=false --prerelease
+            fi
+          elif [[ "$channel" == "stable" ]]; then
+            gh release create "$TAG" --verify-tag --draft \
+              --title "$title" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" --verify-tag --prerelease \
+              --title "$title" \
+              --notes-file release-notes.md
+          fi
+
+          mapfile -t existing_assets < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          for existing_asset in "${existing_assets[@]}"; do
+            keep=false
+            for expected_asset in "${expected_assets[@]}"; do
+              if [[ "$existing_asset" == "$expected_asset" ]]; then
+                keep=true
+                break
+              fi
+            done
+            if [[ "$keep" != "true" ]]; then
+              echo "Removing stale release asset: $existing_asset"
+              gh release delete-asset "$TAG" "$existing_asset" --yes
+            fi
+          done
+
+          mapfile -d '' assets < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
+          gh release upload "$TAG" "${assets[@]}" --clobber
+
+          mapfile -t final_assets < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          printf '%s\n' "${expected_assets[@]}" > expected-release-assets.txt
+          printf '%s\n' "${final_assets[@]}" > actual-release-assets.txt
+          if ! diff -u expected-release-assets.txt actual-release-assets.txt; then
+            echo "Published release assets do not match the validated asset set." >&2
+            exit 1
+          fi
+
+          final_state=$(gh release view "$TAG" --json isDraft,isPrerelease)
+          final_draft=$(jq -r '.isDraft' <<<"$final_state")
+          final_prerelease=$(jq -r '.isPrerelease' <<<"$final_state")
+          if [[ "$channel" == "stable" && ( "$final_draft" != "true" || "$final_prerelease" == "true" ) ]]; then
+            echo "Stable tag did not remain a draft stable release." >&2
+            exit 1
+          fi
+          if [[ "$channel" == "prerelease" && ( "$final_draft" != "false" || "$final_prerelease" != "true" ) ]]; then
+            echo "Prerelease tag did not publish as a prerelease." >&2
+            exit 1
+          fi
+          remote_notes=$(gh release view "$TAG" --json body --jq '.body')
+          expected_notes=$(cat release-notes.md)
+          if [[ "$remote_notes" != "$expected_notes" ]]; then
+            echo "Published release notes differ from the validated notes file." >&2
+            exit 1
+          fi
+          echo "Verified release state, release notes, and exact public asset list for $TAG."

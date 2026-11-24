@@ -43,7 +43,9 @@ private val Context.settings: DataStore<Preferences> by preferencesDataStore("se
  *   AES-GCM key — next to the public-key wire form, and rebuilt from the scalar at every
  *   launch. The scalar being recoverable (by this app on this device, through the
  *   Keystore wrap) is exactly what makes identity *backup & restore* possible; the old
- *   Keystore-only storage could never export the key at all.
+ *   Keystore-only storage could never export the key at all. In the seeded model,
+ *   wrapping or durable-persistence errors stop creation/restore/migration rather than
+ *   falling back to plaintext.
  * * **Legacy Keystore installs** (alias `ripple-identity-v1`, API ≥ 31): keep working
  *   from the Keystore. Their key is non-exportable *by design*, so backup cannot be
  *   created from them (docs/BACKUP.md §6); restoring a backup *does* migrate them onto
@@ -60,7 +62,7 @@ object IdentityStore {
     private const val VERSION_SEEDED = 2
     private const val K_VERSION = "id_version"
     private const val K_WIRE = "pub_wire"                 // public key wire form, hex (not secret)
-    private const val K_SCALAR = "scalar_plain"           // only when Keystore wrap unavailable
+    private const val K_SCALAR = "scalar_plain"           // legacy unwrapped value; migrate to Keystore wrapping on load
     private const val K_SCALAR_WRAPPED = "scalar_wrapped" // AES-GCM(seed) via Keystore key
     private const val K_SCALAR_IV = "scalar_iv"
     private const val K_PKCS8 = "pkcs8"                    // legacy software install
@@ -74,7 +76,12 @@ object IdentityStore {
         if (prefs.getInt(K_VERSION, 0) >= VERSION_SEEDED) return loadSeeded(prefs)
         if (prefs.contains(K_PKCS8)) return loadLegacySoftware(prefs)
         if (android.os.Build.VERSION.SDK_INT >= 31) {
-            legacyKeystoreIdentity()?.let { return it }
+            // A missing legacy alias means this is a new install; a KeyStore error must
+            // propagate instead of silently creating a different node identity.
+            return legacyOrCreate(
+                readLegacy = { legacyKeystoreIdentity() },
+                create = { createSeeded(prefs) },
+            )
         }
         return createSeeded(prefs)
     }
@@ -96,40 +103,50 @@ object IdentityStore {
      * id and strand every peer's pin, which is worse than a visible crash (docs/BACKUP.md §5).
      */
     private fun loadSeeded(prefs: SharedPreferences): Identity {
+        val hasLegacyPlainScalar = prefs.contains(K_SCALAR)
         val scalar = readScalar(prefs)
+        check(scalar.size == 32) { "stored identity scalar has invalid length" }
         val wireHex = prefs.getString(K_WIRE, null) ?: error("seeded identity missing public key")
         val priv = KeyFactory.getInstance("EC").generatePrivate(ECPrivateKeySpec(BigInteger(1, scalar), Crypto.p256Params))
-        return Identity(priv, Crypto.publicKeyFromWire(wireHex.hexToBytes()))
+        val identity = requireMatchingKeyPair(Identity(priv, Crypto.publicKeyFromWire(wireHex.hexToBytes())))
+        if (hasLegacyPlainScalar) writeSeeded(prefs, scalar, identity.publicKeyWire)
+        return identity
     }
 
+    /** Persist only a Keystore-wrapped scalar, and do not return an identity until the write is durable. */
     private fun writeSeeded(prefs: SharedPreferences, scalar: ByteArray, wire: ByteArray) {
-        val editor = prefs.edit()
-        editor.putInt(K_VERSION, VERSION_SEEDED).putString(K_WIRE, wire.toHex())
-        editor.remove(K_SCALAR).remove(K_SCALAR_WRAPPED).remove(K_SCALAR_IV)
-        // Remove the legacy fields so load() can never fall back to the old key after a restore.
-        editor.remove(K_PKCS8).remove(K_X509)
-        val key = runCatching { wrapKey() }.getOrNull()
-        val wrapped = key?.let {
-            runCatching {
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(Cipher.ENCRYPT_MODE, it)
-                b64encode(cipher.doFinal(scalar)) to b64encode(cipher.iv)
-            }.getOrNull()
+        require(scalar.size == 32) { "identity scalar must be 32 bytes" }
+        require(wire.size == 65 && wire[0] == 0x04.toByte()) { "identity public key is malformed" }
+        writeWrappedScalar(scalar, keyProvider = { wrapKey(createIfMissing = true) }) { ciphertext, iv ->
+            val editor = prefs.edit()
+            editor.putInt(K_VERSION, VERSION_SEEDED).putString(K_WIRE, wire.toHex())
+            editor.putString(K_SCALAR_WRAPPED, ciphertext).putString(K_SCALAR_IV, iv)
+            editor.remove(K_SCALAR)
+            // Remove the legacy fields so load() can never fall back to the old key after a restore.
+            editor.remove(K_PKCS8).remove(K_X509)
+            editor.commit()
         }
-        if (wrapped != null) {
-            editor.putString(K_SCALAR_WRAPPED, wrapped.first).putString(K_SCALAR_IV, wrapped.second)
-        } else {
-            editor.putString(K_SCALAR, b64encode(scalar))
-            EventLog.global.w("identity", "Keystore wrap unavailable; identity scalar stored in app-private prefs only")
-        }
-        editor.apply()
+    }
+
+    /** Testable write boundary: key/encryption errors propagate before persistence is attempted. */
+    internal fun writeWrappedScalar(
+        scalar: ByteArray,
+        keyProvider: () -> SecretKey,
+        persist: (ciphertext: String, iv: String) -> Boolean,
+    ) {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, keyProvider())
+        val ciphertext = b64encode(cipher.doFinal(scalar))
+        val iv = b64encode(cipher.iv)
+        check(persist(ciphertext, iv)) { "identity could not be saved securely" }
     }
 
     private fun readScalar(prefs: SharedPreferences): ByteArray {
+        // Read old unwrapped installs once, then loadSeeded migrates them to the wrapped form.
         prefs.getString(K_SCALAR, null)?.let { return b64decode(it) }
         val wrapped = prefs.getString(K_SCALAR_WRAPPED, null) ?: error("seeded identity has no stored scalar")
         val iv = prefs.getString(K_SCALAR_IV, null)?.let { b64decode(it) } ?: error("seeded identity missing wrap IV")
-        val key = wrapKey() ?: error("Keystore wrap key missing; identity scalar unreadable on this device")
+        val key = wrapKey(createIfMissing = false)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
         return cipher.doFinal(b64decode(wrapped))
@@ -137,21 +154,21 @@ object IdentityStore {
 
     /**
      * Non-exportable AES-256-GCM key in the Android Keystore used only to wrap the identity
-     * scalar at rest. Returns null only if the Keystore itself is unavailable.
+     * scalar at rest. Errors propagate; callers must never downgrade to unwrapped storage.
      */
-    private fun wrapKey(): SecretKey? {
-        return try {
-            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-            (ks.getKey(WRAP_ALIAS, null) as? SecretKey)?.let { return it }
-            val spec = KeyGenParameterSpec.Builder(WRAP_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-                .setKeySize(256)
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .build()
-            KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply { init(spec) }.generateKey()
-        } catch (e: Exception) {
-            null
-        }
+    private fun wrapKey(createIfMissing: Boolean): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val existing = ks.getKey(WRAP_ALIAS, null)
+        if (existing != null) return existing as? SecretKey ?: error("Keystore wrap key has an unexpected type")
+        if (ks.containsAlias(WRAP_ALIAS)) error("Keystore wrap key is unavailable")
+        if (!createIfMissing) error("Keystore wrap key missing; identity scalar unreadable on this device")
+
+        val spec = KeyGenParameterSpec.Builder(WRAP_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+            .setKeySize(256)
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .build()
+        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply { init(spec) }.generateKey()
     }
 
     // ---- backup / restore API (Phase 0.3) ----------------------------------------------
@@ -188,20 +205,32 @@ object IdentityStore {
 
     // ---- legacy paths --------------------------------------------------------------------
 
-    private fun legacyKeystoreIdentity(): Identity? = try {
+    private fun legacyKeystoreIdentity(): Identity? {
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        val entry = ks.getEntry(LEGACY_KEYSTORE_ALIAS, null) as? KeyStore.PrivateKeyEntry
-        entry?.let { Identity(it.privateKey, it.certificate.publicKey) }
-    } catch (e: Exception) {
-        null
+        val storedEntry = ks.getEntry(LEGACY_KEYSTORE_ALIAS, null) ?: return null
+        val entry = storedEntry as? KeyStore.PrivateKeyEntry
+            ?: error("legacy identity entry has an unexpected type")
+        return requireMatchingKeyPair(Identity(entry.privateKey, entry.certificate.publicKey))
     }
 
     private fun loadLegacySoftware(prefs: SharedPreferences): Identity {
         val kf = KeyFactory.getInstance("EC")
         val priv = kf.generatePrivate(PKCS8EncodedKeySpec(b64decode(prefs.getString(K_PKCS8, "")!!)))
         val pub = kf.generatePublic(X509EncodedKeySpec(b64decode(prefs.getString(K_X509, "")!!)))
-        return Identity(priv, pub)
+        return requireMatchingKeyPair(Identity(priv, pub))
     }
+
+    private fun requireMatchingKeyPair(identity: Identity): Identity {
+        val challenge = Crypto.randomBytes(32)
+        check(Crypto.verify(identity.publicKey, challenge, identity.sign(challenge))) {
+            "stored identity private key does not match its public key"
+        }
+        return identity
+    }
+
+    /** Do not run the creation path if reading a legacy identity throws. */
+    internal fun legacyOrCreate(readLegacy: () -> Identity?, create: () -> Identity): Identity =
+        readLegacy() ?: create()
 
     // ---- misc ---------------------------------------------------------------------------
 

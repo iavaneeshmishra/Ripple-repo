@@ -21,6 +21,7 @@ struct BackupView: View {
     @State private var installError: String?
     @State private var shareItem: ShareItem?
     @State private var busy = false
+    @State private var backupFailure: String?
 
     private struct ShareItem: Identifiable { let text: String; var id: String { text } }
 
@@ -43,14 +44,17 @@ struct BackupView: View {
                 Text("The passphrase encrypts the export. It is never stored anywhere — a forgotten passphrase makes the backup permanently unreadable.")
                     .font(.footnote).foregroundStyle(.secondary)
                 SecureField("Passphrase (min 8 characters)", text: $passphrase)
-                    .onChange(of: passphrase) { _, _ in blob = nil }
+                    .onChange(of: passphrase) { _, _ in blob = nil; backupFailure = nil }
                 SecureField("Repeat passphrase", text: $passphrase2)
-                    .onChange(of: passphrase2) { _, _ in blob = nil }
+                    .onChange(of: passphrase2) { _, _ in blob = nil; backupFailure = nil }
                 HStack {
                     Button(busy ? "Working…" : "Create backup code") { create() }
                         .disabled(!canCreate || busy)
                     Spacer()
                     if busy { ProgressView() }
+                }
+                if let backupFailure {
+                    Text(backupFailure).font(.footnote).foregroundStyle(.red)
                 }
                 if let blob {
                     VStack(alignment: .leading, spacing: 8) {
@@ -81,9 +85,9 @@ struct BackupView: View {
                     .font(.caption.monospaced())
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-                    .onChange(of: restoreText) { _, _ in restorePayload = nil; restoreFailure = nil; restored = false }
+                    .onChange(of: restoreText) { _, _ in restorePayload = nil; restoreFailure = nil; restored = false; installError = nil }
                 SecureField("Passphrase", text: $restorePassphrase)
-                    .onChange(of: restorePassphrase) { _, _ in restorePayload = nil; restoreFailure = nil; restored = false }
+                    .onChange(of: restorePassphrase) { _, _ in restorePayload = nil; restoreFailure = nil; restored = false; installError = nil }
                 HStack {
                     Button(busy ? "Working…" : "Check code") { check() }
                         .disabled(restoreText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || restorePassphrase.isEmpty || busy)
@@ -134,11 +138,17 @@ struct BackupView: View {
     private func create() {
         guard !busy else { return }
         busy = true
+        backupFailure = nil
+        blob = nil
         let pw = passphrase
         Task.detached(priority: .userInitiated) {
-            let material = IdentityStore.exportMaterial()
-            let blob = Backup.createBlob(scalar: material.scalar, publicKeyWire: material.wire, passphrase: pw)
-            await MainActor.run { self.blob = blob; self.busy = false }
+            do {
+                let material = try IdentityStore.exportMaterial()
+                let blob = Backup.createBlob(scalar: material.scalar, publicKeyWire: material.wire, passphrase: pw)
+                await MainActor.run { self.blob = blob; self.busy = false }
+            } catch {
+                await MainActor.run { self.backupFailure = error.localizedDescription; self.busy = false }
+            }
         }
     }
 
@@ -158,14 +168,12 @@ struct BackupView: View {
     }
 
     private func install(_ payload: Data) {
-        let ok = IdentityStore.prepareRestore(scalar: Backup.scalar(of: payload), wire: Backup.publicKey(of: payload))
-        if ok {
+        do {
+            try IdentityStore.prepareRestore(scalar: Backup.scalar(of: payload), wire: Backup.publicKey(of: payload))
             restored = true
-        } else {
-            // Decoded fine but the scalar does not match the embedded public key — a
-            // hand-forged or corrupt payload; refuse and explain.
-            restorePayload = nil
-            installError = "Refused: the private key in this code does not match its own public key. The blob is corrupt or hand-forged."
+            installError = nil
+        } catch {
+            installError = error.localizedDescription
         }
     }
 }

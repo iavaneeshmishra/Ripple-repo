@@ -43,8 +43,11 @@ object PacketFactory {
         build(identity, PacketType.MESSAGE, text.toByteArray(Charsets.UTF_8))
 
     fun directText(identity: Identity, destination: NodeId, recipientWire: ByteArray, text: String): Packet {
+        val plaintext = text.toByteArray(Charsets.UTF_8)
+        val eciesOverhead = 65 + 12 + 16
+        require(plaintext.size <= Protocol.MAX_PAYLOAD - eciesOverhead) { "direct message payload too large" }
         val messageId = Crypto.randomBytes(Protocol.MESSAGE_ID_SIZE)
-        val box = Crypto.encrypt(recipientWire, messageId, identity.nodeId, destination, text.toByteArray(Charsets.UTF_8))
+        val box = Crypto.encrypt(recipientWire, messageId, identity.nodeId, destination, plaintext)
         return build(identity, PacketType.MESSAGE, box, destination, Flags.ENCRYPTED, messageId = messageId)
     }
 

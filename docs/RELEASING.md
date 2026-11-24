@@ -1,13 +1,25 @@
 # Releasing Ripple
 
-This runbook is the source of truth for cutting the Android and iOS apps from
-the same tagged commit. It deliberately does not automate store submission:
-maintainers inspect and upload signed artifacts to the Play internal track and
-TestFlight first.
+This runbook is the source of truth for producing Android and iOS build
+artifacts from the same tagged commit. The single tag-triggered workflow,
+`.github/workflows/release.yml`, builds the debug APK and unsigned iOS archive
+for every `v*` tag, and builds an Android release AAB for stable tags. Its sole
+`publish` job creates or updates the tag's GitHub Release; build jobs only
+upload workflow artifacts and have read-only permissions.
+
+Prerelease Releases contain a clearly labeled debug APK for field testing. A
+stable release remains a draft until reviewed and contains either a Play
+upload-ready, upload-key-signed AAB or an explicitly unsigned, non-store-ready
+AAB. The unsigned iOS archive is always a workflow artifact, not an IPA or a
+GitHub Release asset. Store submission and iOS signing/export remain manual.
+
+Before using the workflow, protect the `v*` tag namespace with a repository
+ruleset that restricts tag creation and updates to release maintainers. Do not
+dispatch a release build from an unreviewed branch.
 
 ## 1. Prepare one release commit
 
-Prerequisites are Node 18+, JDK 17, and (for iOS) macOS with Xcode 15.4+ and
+Prerequisites are Node 22+, JDK 17, and (for iOS) macOS with Xcode 15.4+ and
 XcodeGen. A release also needs Google Play Console and Apple Developer/App Store
 Connect access.
 
@@ -21,7 +33,8 @@ Connect access.
 
    ```bash
    node tools/i18n/extract-ios.js
-   node tools/protocol/test.js                 # must remain 16/16 for app-only work
+   node tools/protocol/test.js                 # all protocol regression tests must pass
+   node tools/release/test.js                   # dry-run stable/prerelease assets and notes
    node tools/protocol/gen-vectors.js
    git diff --exit-code protocol/test-vectors.json \
      android/app/src/test/resources/test-vectors.json \
@@ -38,8 +51,35 @@ Connect access.
    git push origin v1.0.1
    ```
 
-The tag starts `.github/workflows/release.yml`. Keep Android and iOS artifacts,
-store records, and release notes tied to that same tag/commit.
+For every `v*` tag, `.github/workflows/release.yml` runs protocol conformance
+and release-payload dry-run tests, builds the Android debug APK and unsigned iOS
+archive, then uploads those as workflow artifacts. Stable tags (no hyphen) also
+build an Android release AAB. The only job with `contents: write` is `publish`;
+it validates checksums, constructs the release notes and exact public asset set,
+then creates or updates the GitHub Release, prunes stale attachments, and verifies
+the final release notes and exact remote asset list.
+
+- **Prerelease tag** (for example, `v1.0.1-rc.1`): publish the debug APK,
+  `SHA256SUMS`, `ARTIFACT-NOTICE.txt`, and `RELEASING.md` as a prerelease. The
+  APK is for testing only, not store-ready. The unsigned iOS archive is a
+  workflow artifact and is not an `.ipa` or a release asset.
+- **Stable tag** (for example, `v1.0.1`): create or update a **draft** release
+  with one AAB, its `SHA256SUMS`, `SIGNING-NOTICE.txt`, and `RELEASING.md`. With
+  all four Android signing secrets configured, the asset is named
+  `ripple-<tag>-store-ready.aab` and is signed with the Play upload key. With no
+  secrets, it is `ripple-<tag>-unsigned.aab` and the notice and release notes
+  explicitly say not to upload it to Play. A partial signing configuration
+  fails the build. The debug APK, iOS archive, and R8 mapping file remain
+  workflow artifacts; the mapping file is never attached to the public release.
+
+A rerun may replace assets only on a draft stable release; the workflow refuses
+to alter an already-published stable release. A prerelease tag creates a
+prerelease, or updates an existing draft/prerelease. A manual dispatch is
+restricted to `master`, builds workflow artifacts, and never creates or updates
+a GitHub Release. Keep all build artifacts, store records, and notes tied to the
+same tag and commit SHA. Run `node tools/release/test.js` to exercise the signed,
+unsigned, and prerelease payload/notes paths with temporary fixtures; it does
+not call GitHub or modify a release.
 
 ## 2. Android signing
 
@@ -78,10 +118,11 @@ gh secret set ANDROID_KEY_PASSWORD          # paste at the prompt
 ```
 
 All four present means CI signs the AAB. None present means CI intentionally
-publishes an **unsigned** AAB plus `SIGNING-NOTICE.txt` and this runbook. A
-partial configuration fails rather than silently producing the wrong artifact.
-Do not upload an artifact whose filename or notice says `unsigned`; configure
-all secrets and rerun the workflow from the tag instead.
+produces an **unsigned** AAB plus `SIGNING-NOTICE.txt` and this runbook. On a
+stable tag, these files are attached to the draft release; manual runs save them
+only as a workflow artifact. A partial configuration fails rather than silently
+producing the wrong artifact. Do not upload an artifact whose filename or notice
+says `unsigned`; configure all secrets and rerun the tag workflow instead.
 
 To make the same signed bundle locally, use environment variables so secrets do
 not enter Gradle files:
@@ -92,7 +133,6 @@ export RIPPLE_KEYSTORE_PATH=/absolute/path/ripple-upload.jks
 read -rsp 'Keystore password: ' RIPPLE_KEYSTORE_PASSWORD; export RIPPLE_KEYSTORE_PASSWORD; echo
 export RIPPLE_KEY_ALIAS=ripple-upload
 read -rsp 'Key password: ' RIPPLE_KEY_PASSWORD; export RIPPLE_KEY_PASSWORD; echo
-gradle wrapper --gradle-version 8.9 --no-daemon    # only if gradlew is absent
 ./gradlew clean bundleRelease --no-daemon
 jarsigner -verify app/build/outputs/bundle/release/app-release.aab
 unset RIPPLE_KEYSTORE_PASSWORD RIPPLE_KEY_PASSWORD
@@ -100,15 +140,21 @@ unset RIPPLE_KEYSTORE_PASSWORD RIPPLE_KEY_PASSWORD
 
 ### CI artifact and no-internet check
 
-For both tag and manual runs, the workflow:
+For stable-tag builds and manual runs on `master`, the Android job uses the
+checked-in Gradle 8.9 wrapper and JDK 17, runs `bundleRelease`, and fails if any
+merged release manifest declares `android.permission.INTERNET`. When signing is
+configured, it verifies the AAB signature and labels the bundle
+`store-ready`; with no signing secrets, it clearly labels the artifact
+`unsigned` and not store-ready. For tags, the sole `publish` job attaches the
+AAB, `SHA256SUMS`, signing notice, and runbook to a stable draft; manual runs
+only produce workflow artifacts.
 
-- runs `bundleRelease` with JDK 17;
-- fails if any merged release manifest declares
-  `android.permission.INTERNET`;
-- verifies a configured signature and uploads the AAB, R8 `mapping.txt` when
-  present, signing notice, and this runbook as a workflow artifact;
-- attaches tag builds to a draft GitHub release (or an existing release for the
-  tag).
+The Android debug APK is always a separate debug-signed workflow artifact and
+is only attached to prereleases for field testing. The unsigned iOS archive is
+also a workflow artifact, never an IPA or GitHub Release asset. The R8
+`mapping.txt` file is retained only in the Android bundle workflow artifact; it
+is not attached to the public release. For Play, download it from the same
+workflow run and upload it to Play Console alongside the AAB.
 
 Before store upload, inspect the workflow run and certificate. The source
 manifest's explicit no-internet invariant can also be checked quickly with:
@@ -129,7 +175,8 @@ future dependency cannot smuggle the permission in unnoticed.
    has no server transport; SOS location is attached only after the user's
    opt-in. Store forms and a privacy policy still need maintainer review.
 3. Open **Testing → Internal testing**, create a release, and upload the
-   `signed.aab` from the tag workflow. Upload `mapping.txt` for de-obfuscation.
+   signed `.aab` from the stable tag's draft release or workflow artifact.
+   Upload `mapping.txt` from that workflow run for de-obfuscation.
 4. Confirm Play reports the expected version name/code and upload certificate.
    Add internal testers, review warnings, roll out, and install from the Play
    link on at least two physical BLE-capable phones.
@@ -151,6 +198,11 @@ new dependencies are reproducibly obtainable by F-Droid and that no proprietary
 service SDK has entered the app.
 
 ## 3. iOS archive, export, and TestFlight
+
+The tag workflow uploads `Ripple.xcarchive` as the `ripple-ios-archive` workflow
+artifact. CI builds it with code signing disabled; it is not an `.ipa`, cannot be
+installed directly, and is not attached to the GitHub Release. Use a signing
+team and the export procedure below to produce an App Store/TestFlight IPA.
 
 ### Signing setup
 
@@ -229,6 +281,11 @@ document that decision in a reviewed PR before changing it. This runbook records
 the project's technical decision, not legal advice.
 
 ## 4. Final release record
+
+Before publishing the stable GitHub draft, review the tag and commit, AAB signing
+notice and certificate fingerprint, release notes, and `SHA256SUMS`; confirm the
+iOS archive has been signed/exported and tested separately. The workflow leaves
+the stable release as a draft so a maintainer can make this review first.
 
 For both stores, record:
 

@@ -9,13 +9,16 @@ enum MeshProtocol {
     static let headerSize = 46
     static let signatureSize = 64
     static let maxPacket = headerSize + maxPayload + signatureSize
+    static let maxReassemblyStreams = 8
+    static let maxReassemblyBytes = 32 * 1024
     static let maxNameBytes = 64
     static let nodeIdSize = 8
     static let messageIdSize = 16
     static let hkdfInfo = Data("ripple/v1/msg".utf8)
 
     static let seenTTL: TimeInterval = 24 * 3600
-    // Store-and-forward guarantee: relayed packets are held for 72 h.
+    static let maxFutureSkew: TimeInterval = 24 * 3600
+    // Relay-store expiry is a maximum retention age; capacity pressure can evict earlier.
     static let relayTTL: TimeInterval = 72 * 3600
     static let reassemblyTTL: TimeInterval = 10
 
@@ -138,7 +141,8 @@ final class RateLimiter {
 }
 
 enum ProtocolError: Error, Equatable {
-    case tooShort, unsupportedVersion(UInt8), unknownType(UInt8), payloadTooLarge, lengthMismatch
+    case tooShort, unsupportedVersion(UInt8), unknownType(UInt8), ttlOutOfRange(UInt8), payloadTooLarge, lengthMismatch
+    case messageEncryptionModeMismatch
     case badPublicKey, announceMalformed, eciesMalformed, nameTooLong
 }
 
@@ -193,10 +197,17 @@ struct Packet: Equatable {
     var isEncrypted: Bool { flags & Flags.encrypted != 0 }
     var messageIdHex: String { messageId.hex }
 
-    func withTTL(_ t: UInt8) -> Packet { var p = self; p.ttl = t; return p }
+    func withTTL(_ t: UInt8) -> Packet {
+        precondition(t <= MeshProtocol.maxTTL, "ttl out of range")
+        var p = self; p.ttl = t; return p
+    }
 
     /// Header + payload, without signature.
     func encodeUnsigned() -> Data {
+        precondition(ttl <= MeshProtocol.maxTTL, "ttl out of range")
+        precondition(payload.count <= MeshProtocol.maxPayload, "payload too large")
+        precondition(type != .message || ((flags & Flags.encrypted != 0) != destination.isBroadcast),
+                     "message encryption mode does not match destination")
         var d = Data(capacity: MeshProtocol.headerSize + payload.count)
         d.append(MeshProtocol.version)
         d.append(type.rawValue)
@@ -226,16 +237,23 @@ struct Packet: Equatable {
         guard b.count >= MeshProtocol.headerSize + MeshProtocol.signatureSize else { throw ProtocolError.tooShort }
         guard b[0] == MeshProtocol.version else { throw ProtocolError.unsupportedVersion(b[0]) }
         guard let type = PacketType(rawValue: b[1]) else { throw ProtocolError.unknownType(b[1]) }
+        let ttl = b[3]
+        guard ttl <= MeshProtocol.maxTTL else { throw ProtocolError.ttlOutOfRange(ttl) }
+        let flags = b[2]
+        let destination = NodeId(b.subdata(in: 28..<36))
+        if type == .message && ((flags & Flags.encrypted != 0) == destination.isBroadcast) {
+            throw ProtocolError.messageEncryptionModeMismatch
+        }
         let payloadLength = Int(b[44]) << 8 | Int(b[45])
         guard payloadLength <= MeshProtocol.maxPayload else { throw ProtocolError.payloadTooLarge }
         guard b.count == MeshProtocol.headerSize + payloadLength + MeshProtocol.signatureSize else { throw ProtocolError.lengthMismatch }
         var ts: UInt64 = 0
         for i in 36..<44 { ts = ts << 8 | UInt64(b[i]) }
         return Packet(
-            type: type, flags: b[2], ttl: b[3],
+            type: type, flags: flags, ttl: ttl,
             messageId: b.subdata(in: 4..<20),
             source: NodeId(b.subdata(in: 20..<28)),
-            destination: NodeId(b.subdata(in: 28..<36)),
+            destination: destination,
             timestamp: ts,
             payload: b.subdata(in: MeshProtocol.headerSize..<(MeshProtocol.headerSize + payloadLength)),
             signature: b.subdata(in: (MeshProtocol.headerSize + payloadLength)..<b.count)

@@ -5,9 +5,9 @@ on:
     branches: ["**"]
   pull_request:
 
+# Read-only by default; build jobs execute repository code from pull requests.
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   protocol:
@@ -15,9 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with: { node-version: 22 }
       - run: node tools/protocol/test.js
+      - name: Release payload dry-run tests
+        run: node tools/release/test.js
       - name: Vectors are up to date (and copies in both apps match)
         run: |
           node tools/protocol/gen-vectors.js && git diff --exit-code protocol/test-vectors.json
@@ -30,15 +34,11 @@ jobs:
     needs: protocol
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v5
-      - name: Bootstrap Gradle wrapper
-        working-directory: android
-        run: |
-          if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.9 --no-daemon
-          fi
       - name: Build and test
         working-directory: android
         run: |
@@ -53,11 +53,7 @@ jobs:
             echo '```'
             grep -E "^e: |error:|FAILED|Test.*FAILED|tests completed|BUILD " gradle.log | sed 's#/home/runner/work/NewRepo/NewRepo/##' | sort -u | head -80
             echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY" > android-errors.md
-      - name: Comment errors on PR
-        if: failure() && github.event_name == 'pull_request'
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh pr comment ${{ github.event.pull_request.number }} --body-file android/android-errors.md
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         with:
           name: ripple-debug-apk
@@ -69,18 +65,13 @@ jobs:
     needs: protocol
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v5
-      - name: Bootstrap Gradle wrapper
-        working-directory: android
-        run: |
-          if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.9 --no-daemon
-          fi
       # Catches R8/minify breakage on PRs instead of only at tag time. No
-      # signing secrets are referenced here (the release workflow is the only
-      # job that injects RIPPLE_* signing env), so the bundle is unsigned and
+      # signing secrets are referenced here, so the bundle is unsigned and
       # nothing is uploaded to any release.
       - name: Build unsigned release bundle (exercises R8)
         working-directory: android
@@ -119,6 +110,8 @@ jobs:
     needs: protocol
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - run: brew install xcodegen
       - name: Generate project
         working-directory: ios
@@ -150,8 +143,7 @@ jobs:
           xcodebuild test -scheme Ripple -project Ripple.xcodeproj \
             -destination "id=${{ steps.sim.outputs.udid }}" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
-            -resultBundlePath TestResults.xcresult 2>&1 | tee xcodebuild.log | grep -E "error:|Test Case|Test Suite|Executed|BUILD|TEST" || true
-          test ${PIPESTATUS[0]} -eq 0
+            -resultBundlePath TestResults.xcresult 2>&1 | tee xcodebuild.log
           grep -q "Test Suite 'All tests' passed" xcodebuild.log
       - name: Summarize errors
         if: always()
@@ -163,11 +155,7 @@ jobs:
             echo '```'
             grep -E "error:|Executed|Test Suite 'All tests'|\*\* (BUILD|TEST) " xcodebuild.log | sed 's#/Users/runner/work/NewRepo/NewRepo/##' | sort -u | head -80
             echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY" > ios-errors.md
-      - name: Comment errors on PR
-        if: failure() && github.event_name == 'pull_request'
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh pr comment ${{ github.event.pull_request.number }} --body-file ios/ios-errors.md
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         if: always()
         with:

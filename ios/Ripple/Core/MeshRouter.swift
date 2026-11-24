@@ -42,6 +42,11 @@ struct SosBeacon {
     let timestamp: UInt64
 }
 
+struct RelaySnapshot {
+    let packet: Packet
+    let expiresAt: Date
+}
+
 protocol RouterListener: AnyObject {
     func router(_ router: MeshRouter, didReceive message: InboundMessage)
     func router(_ router: MeshRouter, didReceiveAck messageId: Data, from: NodeId)
@@ -138,17 +143,25 @@ final class MeshRouter {
         locked { for p in saved where peers[p.nodeId.hex] == nil { peers[p.nodeId.hex] = p } }
     }
 
-    func importRelayStore(_ packets: [Packet]) {
+    func importRelayStore(_ entries: [RelaySnapshot]) {
         locked {
             let t = now()
-            for p in packets {
-                markSeen(p, at: t)
-                putRelay(p.messageIdHex, RelayEntry(p, expiresAt: t.addingTimeInterval(MeshProtocol.relayTTL)))
+            for saved in entries where saved.expiresAt > t {
+                markSeen(saved.packet, at: t)
+                putRelay(saved.packet.messageIdHex, RelayEntry(saved.packet, expiresAt: saved.expiresAt))
             }
         }
     }
 
-    func relayStoreSnapshot() -> [Packet] { locked { relayOrder.compactMap { relayStore[$0]?.packet } } }
+    func relayStoreSnapshot() -> [RelaySnapshot] {
+        locked {
+            let t = now()
+            return relayOrder.compactMap { key in
+                guard let entry = relayStore[key], entry.expiresAt > t else { return nil }
+                return RelaySnapshot(packet: entry.packet, expiresAt: entry.expiresAt)
+            }
+        }
+    }
 
     // MARK: Outbound
 
@@ -232,8 +245,10 @@ final class MeshRouter {
     private func receiveLocked(_ link: Link, _ bytes: Data) {
         guard let p = try? Packet.decode(bytes) else { return }
         let t = now()
-        if Double(p.timestamp) / 1000 > t.timeIntervalSince1970 + MeshProtocol.seenTTL { return }
-        if seen[p.messageIdHex] != nil { return }
+        if Double(p.timestamp) / 1000 > t.timeIntervalSince1970 + MeshProtocol.maxFutureSkew { return }
+        if p.type == .ack && (p.destination.isBroadcast || p.payload.count != MeshProtocol.messageIdSize) { return }
+        purgeExpiredSeen(at: t)
+        if seen[p.messageIdHex] != nil || (relayStore[p.messageIdHex]?.expiresAt ?? .distantPast) > t { return }
         markSeen(p, at: t)
         guard rateAllows(p) else { return } // per-source broadcast flood cap (when configured)
 
@@ -275,7 +290,7 @@ final class MeshRouter {
                 listener?.router(self, didReceive: InboundMessage(messageId: p.messageId, from: p.source, fromName: peer?.name, text: text, isBroadcast: isBroadcast, verified: verified, timestamp: p.timestamp))
                 if forMe, let ack = try? PacketFactory.ack(identity, to: p.source, acknowledged: p.messageId) { _ = originateLocked(ack) }
             case .ack:
-                if forMe && p.payload.count == MeshProtocol.messageIdSize { listener?.router(self, didReceiveAck: p.payload, from: p.source) }
+                if forMe && isExpectedAck(p, at: t) { listener?.router(self, didReceiveAck: p.payload, from: p.source) }
             case .announce:
                 break
             case .sos:
@@ -303,6 +318,15 @@ final class MeshRouter {
             onLinkIdentified(link, peerHex: p.source.hex)
         }
         relay(p, from: link)
+    }
+
+    /// Accept an ACK only for a live direct message originated by this node and addressed to its signer.
+    private func isExpectedAck(_ ack: Packet, at t: Date) -> Bool {
+        guard let original = relayStore[ack.payload.hex], original.expiresAt > t else { return false }
+        let message = original.packet
+        return message.type == .message && message.isEncrypted &&
+            message.source == selfId && !message.destination.isBroadcast &&
+            message.destination == ack.source
     }
 
     // MARK: Internals
@@ -359,8 +383,17 @@ final class MeshRouter {
     }
 
     private func markSeen(_ p: Packet, at t: Date) {
+        purgeExpiredSeen(at: t)
         if seen[p.messageIdHex] == nil { seenOrder.append(p.messageIdHex) }
         seen[p.messageIdHex] = t
         while seenOrder.count > maxSeen { seen[seenOrder.removeFirst()] = nil }
+    }
+
+    private func purgeExpiredSeen(at t: Date) {
+        let expired = seen.compactMap { entry -> String? in
+            t.timeIntervalSince(entry.value) >= MeshProtocol.seenTTL ? entry.key : nil
+        }
+        for id in expired { seen[id] = nil }
+        if !expired.isEmpty { seenOrder.removeAll { seen[$0] == nil } }
     }
 }

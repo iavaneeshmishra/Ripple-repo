@@ -32,21 +32,25 @@ git tag -a v1.0.0-beta.1 -m "Ripple v1.0.0 beta 1"
 git push origin v1.0.0-beta.1
 ```
 
-The **`beta-release`** workflow runs automatically:
+The single **`release.yml`** workflow runs for every `v*` tag. Build jobs are
+read-only; its `publish` job alone receives release-write permission and creates
+or updates the tag's Release. The tag remains pushed if validation fails, but no
+release is published.
 
 | Step | What it produces |
 |------|-----------------|
-| Protocol tests | Must pass; tag is rejected otherwise. |
-| Android | Signed debug APK uploaded as a GitHub Release asset. |
-| iOS | `.ipa` archived (unsigned unless a distribution certificate is configured); uploaded as an artifact. |
-| Test vectors | Checked for staleness. |
+| Protocol + release-payload tests | Must pass before platform builds; vectors are regenerated and compared with both app copies, and release-note/assets dry-run cases are tested. |
+| Android debug build | Debug-signed APK and checksum workflow artifact. On prerelease tags, the publisher attaches it as a field-test-only asset; on stable tags, it stays in the workflow artifacts. |
+| Android stable bundle | For tags without a hyphen, a store-upload-ready AAB signed with the configured Play upload key, or an explicitly unsigned AAB marked not store-ready. Stable releases stay drafts. |
+| iOS | Unsigned `Ripple.xcarchive` workflow artifact. It is not an `.ipa`, is not directly installable, and is not attached to a release. |
+| Publisher | The one `publish` job validates checksums, prepares notes/assets, prunes stale attachments, then verifies the final release notes and asset list. |
 
 ### 1.2 Distribute the beta
 
 | Platform | Channel | Notes |
 |----------|---------|-------|
-| Android | GitHub Release APK + direct link | Testers sideload; enable "Install unknown apps." |
-| iOS | TestFlight (when Apple Developer account is configured) or Ad Hoc build | Requires UDID registration for Ad Hoc. |
+| Android | GitHub prerelease APK + checksum | Debug-signed field-test build; testers sideload and enable "Install unknown apps." Do not use it as a Play Store build. |
+| iOS | Signed/exported archive to TestFlight or Ad Hoc | The CI `.xcarchive` is unsigned and only a workflow artifact; sign/export it using `docs/RELEASING.md`. Ad Hoc requires UDID registration. |
 
 Announce the beta:
 - Post in Discussions (or a pinned issue) with the download link, the field-test
@@ -91,8 +95,8 @@ Same workflow as beta; the tag triggers it.
 |---|------|------|
 | 3.1 | RC soak complete, no regressions. | ✅ |
 | 3.2 | README "Status" section updated to "Released v1.0.0." | ✅ |
-| 3.3 | Git tag `v1.0.0` pushed; `beta-release` workflow creates the GitHub Release. | ✅ |
-| 3.4 | Release notes published on GitHub. | ✅ |
+| 3.3 | Git tag `v1.0.0` pushed; the sole `release.yml` publisher attaches the Android AAB and checksum to a draft, while debug APK and unsigned iOS archive remain labeled workflow artifacts. | ✅ |
+| 3.4 | Maintainer reviews the stable draft, verifies the AAB/checksum and iOS signing/export separately, then publishes the release notes on GitHub. | ✅ |
 | 3.5 | (Optional) Play Store / App Store submissions. | ⏭️ Future. |
 | 3.6 | Announce: social media, project README, Discussions. | ✅ |
 | 3.7 | Lock the release branch (or mark it `protected`); open `main` for v2 work. | ✅ |

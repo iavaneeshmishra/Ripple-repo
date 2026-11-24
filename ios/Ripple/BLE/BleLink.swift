@@ -31,8 +31,13 @@ class BleLink: Link {
     func send(_ packetBytes: Data) {
         workQueue.async { [self] in
             guard !isClosed else { return }
-            pendingFrames.append(contentsOf: Fragmenter.fragment(packetBytes, frameSize: frameSize, streamId: UInt16.random(in: 0...UInt16.max)))
-            pump()
+            do {
+                let frames = try Fragmenter.fragment(packetBytes, frameSize: frameSize, streamId: UInt16.random(in: 0...UInt16.max))
+                pendingFrames.append(contentsOf: frames)
+                pump()
+            } catch {
+                log.w("link", "\(id) dropping packet before BLE send: \(error)")
+            }
         }
     }
 

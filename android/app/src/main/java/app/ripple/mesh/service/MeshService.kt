@@ -32,6 +32,8 @@ import app.ripple.mesh.core.MeshRouter
 import app.ripple.mesh.core.NodeId
 import app.ripple.mesh.core.Packet
 import app.ripple.mesh.core.Peer
+import app.ripple.mesh.core.Protocol
+import app.ripple.mesh.core.RelaySnapshot
 import app.ripple.mesh.core.RouterListener
 import app.ripple.mesh.core.SosBeacon
 import app.ripple.mesh.core.SosLocation
@@ -155,8 +157,10 @@ class MeshService : LifecycleService(), RouterListener {
             })
             val now = System.currentTimeMillis()
             withContext(Dispatchers.IO) { db.relay().purge(now) }
-            val packets = withContext(Dispatchers.IO) { db.relay().live(now) }.mapNotNull { runCatching { Packet.decode(it.bytes) }.getOrNull() }
-            router.importRelayStore(packets)
+            val saved = withContext(Dispatchers.IO) { db.relay().live(now) }.mapNotNull { row ->
+                runCatching { RelaySnapshot(Packet.decode(row.bytes), row.expiresAt) }.getOrNull()
+            }
+            router.importRelayStore(saved)
             _status.update { it.copy(running = true, knownPeers = router.peers().size) }
             startBle()
         }
@@ -230,7 +234,12 @@ class MeshService : LifecycleService(), RouterListener {
     }
 
     override fun onAck(messageId: ByteArray, from: NodeId) {
-        lifecycleScope.launch(Dispatchers.IO) { db.messages().setStatus(messageId.toHex(), MessageStatus.DELIVERED) }
+        val id = messageId.toHex()
+        val conversation = from.hex
+        val localNodeId = router.selfId.hex
+        lifecycleScope.launch(Dispatchers.IO) {
+            db.messages().markDeliveredByAck(id, conversation, localNodeId)
+        }
     }
 
     override fun onPeersChanged(peers: List<Peer>) {
@@ -310,7 +319,11 @@ class MeshService : LifecycleService(), RouterListener {
     /** Broadcast an SOS beacon. `shareLocation` attaches a coarse fix only if granted. */
     suspend fun sendSos(text: String, shareLocation: Boolean) {
         val location = if (shareLocation) currentLocationOrNull() else null
-        router.sendSos(text, location)
+        try {
+            router.sendSos(text, location)
+        } catch (e: IllegalArgumentException) {
+            eventLog.w("service", "SOS was not sent: ${e.message}")
+        }
     }
 
     /** Best-effort last-known location; null unless the operator granted location permission. */
@@ -328,13 +341,21 @@ class MeshService : LifecycleService(), RouterListener {
     }
 
     suspend fun sendBroadcast(text: String) {
-        val id = router.sendBroadcast(text)
+        val id = try { router.sendBroadcast(text) } catch (e: IllegalArgumentException) {
+            persistOutgoing(Crypto.randomBytes(Protocol.MESSAGE_ID_SIZE), BROADCAST_CONVERSATION, text, MessageStatus.FAILED)
+            eventLog.w("service", "broadcast was not sent: ${e.message}")
+            return
+        }
         persistOutgoing(id, BROADCAST_CONVERSATION, text, MessageStatus.SENT)
     }
 
     suspend fun sendDirect(destination: NodeId, text: String) {
-        val id = try { router.sendDirect(destination, text) } catch (e: IllegalStateException) {
-            persistOutgoing(Crypto.randomBytes(16), destination.hex, text, MessageStatus.FAILED); return
+        val id = try { router.sendDirect(destination, text) } catch (_: IllegalStateException) {
+            persistOutgoing(Crypto.randomBytes(Protocol.MESSAGE_ID_SIZE), destination.hex, text, MessageStatus.FAILED); return
+        } catch (e: IllegalArgumentException) {
+            persistOutgoing(Crypto.randomBytes(Protocol.MESSAGE_ID_SIZE), destination.hex, text, MessageStatus.FAILED)
+            eventLog.w("service", "direct message was not sent: ${e.message}")
+            return
         }
         persistOutgoing(id, destination.hex, text, if (router.linkCount() > 0) MessageStatus.SENT else MessageStatus.PENDING)
     }
@@ -353,7 +374,10 @@ class MeshService : LifecycleService(), RouterListener {
 
     private suspend fun persistRelayStore() = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
-        db.relay().upsertAll(router.relayStoreSnapshot().map { RelayPacketEntity(it.messageIdHex, it.encode(), now + app.ripple.mesh.core.Protocol.RELAY_TTL_MS) })
+        db.relay().purge(now)
+        db.relay().upsertAll(router.relayStoreSnapshot().map { saved ->
+            RelayPacketEntity(saved.packet.messageIdHex, saved.packet.encode(), saved.expiresAt)
+        })
     }
 
     // ---- notifications --------------------------------------------------------------

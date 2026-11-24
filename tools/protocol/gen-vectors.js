@@ -123,6 +123,18 @@ vectors.sos = {
   decoded: { type: 4, flags: 0, ttl: 7, messageId: hex(sos.messageId), source: hex(sos.source), destination: hex(sos.destination), timestamp: sos.timestamp.toString(), payloadLength: sosPayload.length },
 };
 
+// --- timestamp range: valid unsigned wire value, but far beyond any acceptable future skew
+const highBitTimestamp = stable('highBitTimestamp', R.buildPacket(alice, {
+  type: R.PacketType.MESSAGE, ttl: 7,
+  messageId: Buffer.from('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff', 'hex'),
+  timestamp: 0x8000000000000000n, payload: Buffer.from('high-bit timestamp'),
+}), alice);
+vectors.highBitTimestamp = {
+  timestamp: highBitTimestamp.timestamp.toString(),
+  unsignedBytes: hex(R.encodeUnsigned(highBitTimestamp)),
+  fullPacket: hex(R.encode(highBitTimestamp)),
+};
+
 // --- fragmentation
 const big = Buffer.alloc(1000); for (let i = 0; i < big.length; i++) big[i] = i & 0xff;
 vectors.fragmentation = {
@@ -136,6 +148,10 @@ vectors.invalid = {
   wrongVersion: hex(Buffer.concat([Buffer.from([2]), R.encode(ann).subarray(1)])),
   truncated: hex(R.encode(ann).subarray(0, 60)),
   tamperedPayload: (() => { const b = Buffer.from(R.encode(bcast)); b[R.HEADER_SIZE] ^= 0x01; return hex(b); })(),
+  ttl8: (() => { const b = Buffer.from(R.encode(ann)); b[3] = 8; return hex(b); })(),
+  ttl255: (() => { const b = Buffer.from(R.encode(ann)); b[3] = 255; return hex(b); })(),
+  directWithoutEncryption: (() => { const b = Buffer.from(R.encode(direct)); b[2] &= ~R.Flags.ENCRYPTED; return hex(b); })(),
+  broadcastWithEncryption: (() => { const b = Buffer.from(R.encode(bcast)); b[2] |= R.Flags.ENCRYPTED; return hex(b); })(),
 };
 
 fs.mkdirSync(path.dirname(outPath), { recursive: true });
