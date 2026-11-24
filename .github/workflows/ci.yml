@@ -40,6 +40,7 @@ jobs:
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v5
       - name: Build and test
+        id: build
         working-directory: android
         run: |
           set -o pipefail
@@ -47,13 +48,33 @@ jobs:
       - name: Summarize errors
         if: always()
         working-directory: android
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
         run: |
           {
             echo "### Android build errors"
             echo '```'
-            grep -E "^e: |error:|FAILED|Test.*FAILED|tests completed|BUILD " gradle.log | sed 's#/home/runner/work/NewRepo/NewRepo/##' | sort -u | head -80
+            if [[ -f gradle.log ]]; then
+              grep -E "^e: |error:|FAILED|Test.*FAILED|tests completed|BUILD |Execution failed|What went wrong" gradle.log | sed 's#/home/runner/work/NewRepo/NewRepo/##' | sort -u | head -80 || true
+            else
+              echo "gradle.log was not produced."
+            fi
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$BUILD_OUTCOME" != "success" && -f gradle.log ]]; then
+            while IFS= read -r line; do
+              [[ -z "$line" ]] || printf '::error title=Android Gradle log tail::%s\n' "${line:0:900}"
+            done < <(tail -n 50 gradle.log)
+          fi
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: android-build-diagnostics
+          path: |
+            android/gradle.log
+            android/app/build/test-results/testDebugUnitTest/
+            android/app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v6
         with:
           name: ripple-debug-apk
