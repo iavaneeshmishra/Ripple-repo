@@ -12,6 +12,11 @@ final class ProtocolVectorsTests: XCTestCase {
     private var v: [String: Any] { Self.vectors }
     private func obj(_ k: String) -> [String: Any] { v[k] as! [String: Any] }
     private func hex(_ o: [String: Any], _ k: String) -> Data { Data(hex: o[k] as! String)! }
+    private func fragmentFrame(_ streamId: UInt16, index: Int, total: Int, payload: Data = Data()) -> Data {
+        var frame = Data([UInt8(streamId >> 8), UInt8(streamId & 0xff), UInt8(index), UInt8(total)])
+        frame.append(payload)
+        return frame
+    }
 
     private lazy var alice = try! Identity(rawScalar: hex(obj("identities")["alice"] as! [String: Any], "privateScalar"))
     private lazy var bob = try! Identity(rawScalar: hex(obj("identities")["bob"] as! [String: Any], "privateScalar"))
@@ -22,6 +27,20 @@ final class ProtocolVectorsTests: XCTestCase {
         XCTAssertEqual((ids["alice"] as! [String: Any])["publicKeyWire"] as! String, alice.publicKeyWire.hex)
         XCTAssertEqual((ids["bob"] as! [String: Any])["nodeId"] as! String, bob.nodeId.hex)
         XCTAssertEqual((ids["alice"] as! [String: Any])["display"] as! String, alice.nodeId.display)
+    }
+
+    func testOutboundPayloadAndECIESOverheadLimits() throws {
+        let maxDirectTextBytes = MeshProtocol.maxPayload - (65 + 12 + 16)
+        let maximumBroadcast = try PacketFactory.broadcastText(alice, String(repeating: "x", count: MeshProtocol.maxPayload))
+        XCTAssertEqual(maximumBroadcast.payload.count, MeshProtocol.maxPayload)
+        let directText = String(repeating: "x", count: maxDirectTextBytes - 3) + "€"
+        XCTAssertEqual(Data(directText.utf8).count, maxDirectTextBytes)
+        let maximumDirect = try PacketFactory.directText(alice, to: bob.nodeId, recipientWire: bob.publicKeyWire, text: directText)
+        XCTAssertEqual(maximumDirect.payload.count, MeshProtocol.maxPayload)
+
+        XCTAssertThrowsError(try PacketFactory.broadcastText(alice, String(repeating: "x", count: MeshProtocol.maxPayload + 1)))
+        XCTAssertThrowsError(try PacketFactory.directText(alice, to: bob.nodeId, recipientWire: bob.publicKeyWire,
+                                                          text: directText + "x"))
     }
 
     func testAnnounceEncodesIdenticallyAndVerifies() throws {
@@ -98,9 +117,9 @@ final class ProtocolVectorsTests: XCTestCase {
         XCTAssertEqual(p.payload, try Packet.decode(hex(obj("directMessage"), "fullPacket")).messageId)
     }
 
-    func testFragmentationVectors() {
+    func testFragmentationVectors() throws {
         let f = obj("fragmentation")
-        let frames = Fragmenter.fragment(hex(f, "input"), frameSize: f["frameSize"] as! Int, streamId: UInt16(f["streamId"] as! Int))
+        let frames = try Fragmenter.fragment(hex(f, "input"), frameSize: f["frameSize"] as! Int, streamId: UInt16(f["streamId"] as! Int))
         let expected = f["frames"] as! [String]
         XCTAssertEqual(frames.map(\.hex), expected)
 
@@ -110,14 +129,121 @@ final class ProtocolVectorsTests: XCTestCase {
         XCTAssertEqual(out?.hex, f["input"] as? String)
 
         let small = f["small"] as! [String: Any]
-        let sf = Fragmenter.fragment(hex(small, "input"), frameSize: small["frameSize"] as! Int, streamId: UInt16(small["streamId"] as! Int))
+        let sf = try Fragmenter.fragment(hex(small, "input"), frameSize: small["frameSize"] as! Int, streamId: UInt16(small["streamId"] as! Int))
         XCTAssertEqual(sf.map(\.hex), small["frames"] as! [String])
+    }
+
+    func testFragmentationAndReassemblyRejectPacketsAboveMaximum() throws {
+        XCTAssertEqual(Fragmenter.maxPacketSize(frameSize: 20), 16 * Fragmenter.maxFragments)
+        XCTAssertFalse(Fragmenter.canFragment(0, frameSize: Fragmenter.header))
+        XCTAssertTrue(Fragmenter.canFragment(16 * Fragmenter.maxFragments, frameSize: 20))
+        XCTAssertFalse(Fragmenter.canFragment(16 * Fragmenter.maxFragments + 1, frameSize: 20))
+        XCTAssertEqual(Fragmenter.maxPacketSize(frameSize: 23), MeshProtocol.maxPacket)
+        XCTAssertTrue(Fragmenter.canFragment(MeshProtocol.maxPacket, frameSize: 23))
+        let legacyFrames = try Fragmenter.fragment(Data(repeating: 0, count: 16 * Fragmenter.maxFragments),
+                                                  frameSize: 20, streamId: 1)
+        XCTAssertEqual(legacyFrames.count, 255)
+        XCTAssertTrue(legacyFrames.allSatisfy { $0.count <= 20 })
+        let fullPacket = Data((0..<MeshProtocol.maxPacket).map { UInt8($0 & 0xff) })
+        let fullFrames = try Fragmenter.fragment(fullPacket, frameSize: 23, streamId: 2)
+        XCTAssertEqual(fullFrames.count, 222)
+        XCTAssertTrue(fullFrames.allSatisfy { $0.count <= 23 })
+        let fullReassembler = Reassembler()
+        let rebuiltFullPacket = fullFrames.compactMap { fullReassembler.push($0) }.first
+        XCTAssertEqual(rebuiltFullPacket, fullPacket)
+        XCTAssertThrowsError(try Fragmenter.fragment(Data(repeating: 0, count: 16 * Fragmenter.maxFragments + 1),
+                                                      frameSize: 20, streamId: 1))
+
+        let packet = Data(repeating: 0xa5, count: MeshProtocol.maxPacket)
+        let frames = try Fragmenter.fragment(packet, frameSize: 512, streamId: 1)
+        let r = Reassembler()
+        let rebuilt = frames.compactMap { r.push($0) }.first
+        XCTAssertEqual(rebuilt, packet)
+
+        let oversized = fragmentFrame(2, index: 0, total: 1,
+                                      payload: Data(repeating: 0, count: MeshProtocol.maxPacket + 1))
+        XCTAssertNil(Reassembler().push(oversized))
+
+        let multipart = Reassembler()
+        XCTAssertNil(multipart.push(fragmentFrame(3, index: 0, total: 2,
+                                                  payload: Data(repeating: 0, count: MeshProtocol.maxPacket))))
+        XCTAssertNil(multipart.push(fragmentFrame(3, index: 1, total: 2, payload: Data([1]))))
+    }
+
+    func testReassemblyCapsActiveStreamsAndBufferedBytes() {
+        var now: TimeInterval = 0
+        let capped = Reassembler(now: { now })
+        for id in 0..<MeshProtocol.maxReassemblyStreams {
+            XCTAssertNil(capped.push(fragmentFrame(UInt16(id), index: 0, total: 2, payload: Data([UInt8(id)]))))
+        }
+        XCTAssertNil(capped.push(fragmentFrame(99, index: 0, total: 2, payload: Data([99]))))
+        XCTAssertNil(capped.push(fragmentFrame(99, index: 1, total: 2, payload: Data([100]))))
+        XCTAssertEqual(capped.push(fragmentFrame(0, index: 1, total: 2, payload: Data([1]))), Data([0, 1]))
+        XCTAssertNil(capped.push(fragmentFrame(99, index: 0, total: 2, payload: Data([99]))))
+        XCTAssertEqual(capped.push(fragmentFrame(99, index: 1, total: 2, payload: Data([100]))), Data([99, 100]))
+
+        var adversarialNow: TimeInterval = 0
+        let worstCase = Reassembler(ttl: 1, now: { adversarialNow })
+        for id in 0..<MeshProtocol.maxReassemblyStreams {
+            XCTAssertNil(worstCase.push(fragmentFrame(UInt16(id), index: 0, total: 255)))
+        }
+        XCTAssertNil(worstCase.push(fragmentFrame(99, index: 0, total: 2, payload: Data([99]))))
+        XCTAssertNil(worstCase.push(fragmentFrame(99, index: 1, total: 2, payload: Data([100]))))
+        adversarialNow = 1
+        XCTAssertNil(worstCase.push(fragmentFrame(100, index: 0, total: 2, payload: Data([10]))))
+        XCTAssertEqual(worstCase.push(fragmentFrame(100, index: 1, total: 2, payload: Data([11]))), Data([10, 11]))
+
+        let buffered = Reassembler(now: { now })
+        let maxPart = Data(repeating: 0x61, count: MeshProtocol.maxPacket)
+        for id in 0..<7 {
+            XCTAssertNil(buffered.push(fragmentFrame(UInt16(id), index: 0, total: 2, payload: maxPart)))
+        }
+        let remaining = MeshProtocol.maxReassemblyBytes - 7 * MeshProtocol.maxPacket
+        let lastPart = Data(repeating: 0x62, count: remaining)
+        XCTAssertNil(buffered.push(fragmentFrame(7, index: 0, total: 2, payload: lastPart)))
+        XCTAssertEqual(buffered.push(fragmentFrame(7, index: 1, total: 2)), lastPart)
+
+        XCTAssertNil(buffered.push(fragmentFrame(7, index: 0, total: 2, payload: lastPart)))
+        XCTAssertNil(buffered.push(fragmentFrame(7, index: 1, total: 2, payload: Data([0x63]))))
+        XCTAssertEqual(buffered.push(fragmentFrame(0, index: 1, total: 2)), maxPart)
+        XCTAssertNil(buffered.push(fragmentFrame(7, index: 1, total: 2, payload: Data([0x63]))))
+        XCTAssertEqual(buffered.push(fragmentFrame(7, index: 0, total: 2, payload: lastPart)),
+                       Data(lastPart + Data([0x63])))
+    }
+
+    func testReassemblyExpiresPartialStreamsAtFixedDeadline() {
+        var now: TimeInterval = 0
+        let r = Reassembler(ttl: 1, now: { now })
+        XCTAssertNil(r.push(fragmentFrame(1, index: 0, total: 2, payload: Data([1]))))
+        now = 0.999
+        XCTAssertEqual(r.push(fragmentFrame(1, index: 1, total: 2, payload: Data([2]))), Data([1, 2]))
+        now = 2
+        XCTAssertNil(r.push(fragmentFrame(2, index: 0, total: 2, payload: Data([3]))))
+        now = 3
+        XCTAssertNil(r.push(fragmentFrame(2, index: 1, total: 2, payload: Data([4]))))
+        now = 3.001
+        XCTAssertEqual(r.push(fragmentFrame(2, index: 0, total: 2, payload: Data([5]))), Data([5, 4]))
+    }
+
+    func testHighBitTimestampVectorPreservesUnsignedWireValue() throws {
+        let high = obj("highBitTimestamp")
+        let packet = try Packet.decode(hex(high, "fullPacket"))
+        XCTAssertEqual(String(packet.timestamp), high["timestamp"] as? String)
+        XCTAssertEqual(packet.encode(), hex(high, "fullPacket"))
+        XCTAssertTrue(Crypto.verify(alice.signing.publicKey, unsignedPacket: packet.encodeUnsigned(), rawSignature: packet.signature))
     }
 
     func testInvalidPacketsRejected() throws {
         let bad = obj("invalid")
         XCTAssertThrowsError(try Packet.decode(hex(bad, "wrongVersion")))
         XCTAssertThrowsError(try Packet.decode(hex(bad, "truncated")))
+        XCTAssertThrowsError(try Packet.decode(hex(bad, "ttl8")))
+        XCTAssertThrowsError(try Packet.decode(hex(bad, "ttl255")))
+        XCTAssertThrowsError(try Packet.decode(hex(bad, "directWithoutEncryption")))
+        XCTAssertThrowsError(try Packet.decode(hex(bad, "broadcastWithEncryption")))
+        XCTAssertThrowsError(try PacketFactory.build(alice, type: .message, payload: Data([1]), ttl: 8))
+        XCTAssertThrowsError(try PacketFactory.build(alice, type: .message, payload: Data([1]), destination: bob.nodeId))
+        XCTAssertThrowsError(try PacketFactory.build(alice, type: .message, payload: Data([1]), flags: Flags.encrypted))
         let tampered = try Packet.decode(hex(bad, "tamperedPayload"))
         XCTAssertFalse(Crypto.verify(alice.signing.publicKey, unsignedPacket: tampered.encodeUnsigned(), rawSignature: tampered.signature))
     }

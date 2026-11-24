@@ -100,6 +100,10 @@ silent mis-decrypts.
   the public wire form is stored beside it. The key pair is rebuilt at each app
   start. At-rest protection is the Keystore, as before; *exportability* is what
   changed, because backup is impossible without the scalar being recoverable.
+  Seeded-model creation, restore, and migration of older unwrapped seeded
+  identities fail closed if wrapping or durable preference storage fails; the app
+  never downgrades a new write to plaintext or reports an identity as saved when
+  it was not.
   A Keystore failure at load **throws** — the app never silently creates a new
   identity (a changed node id would strand every peer's pin).
 * **Android (legacy ≥ API 31 Keystore-only installs):** continue to work, but

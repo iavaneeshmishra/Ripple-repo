@@ -16,6 +16,7 @@ final class BleCentral: NSObject {
     private let txUUID = CBUUID(string: MeshProtocol.txUUID)
 
     private var links: [UUID: CentralLink] = [:]
+    private var restoredPending = Set<UUID>()
     private let log = EventLog.global
     func allLinks() -> [BleLink] { queue.sync { Array(links.values) } }
     func refreshRssi() { queue.async { [self] in links.values.forEach { $0.peripheral.readRSSI() } } }
@@ -65,15 +66,63 @@ final class BleCentral: NSObject {
         let id = peripheral.identifier
         guard links[id] == nil, links.count < maxOutgoing, !shouldSkip(peripheral) else { return }
         if let failedAt = recentlyFailed[id], Date().timeIntervalSince(failedAt) < reconnectBackoff { return }
-        let link = CentralLink(peripheral: peripheral, central: self)
-        link.rssi = rssi
-        links[id] = link
+        let link = makeLink(for: peripheral, rssi: rssi)
         Self.log.info("connecting to \(id)"); log.i("central", "connecting → \(id.uuidString.prefix(8)) (rssi \(link.rssi.map(String.init) ?? "?"))")
         manager.connect(peripheral, options: nil)
+        armSetupTimeout(for: link)
+    }
+
+    /// Keep restored peripherals in the same map used by didConnect and frame callbacks.
+    private func makeLink(for peripheral: CBPeripheral, rssi: Int? = nil) -> CentralLink {
+        if let existing = links[peripheral.identifier] {
+            if let rssi { existing.rssi = rssi }
+            return existing
+        }
+        let link = CentralLink(peripheral: peripheral, central: self)
+        link.rssi = rssi
+        links[peripheral.identifier] = link
+        return link
+    }
+
+    private func armSetupTimeout(for link: CentralLink) {
+        guard !link.setupTimeoutArmed else { return }
+        link.setupTimeoutArmed = true
         queue.asyncAfter(deadline: .now() + 20) { [weak self, weak link] in
             guard let self, let link, !link.ready, !link.isClosed else { return }
             Self.log.warning("\(link.id) setup timeout"); self.log.w("central", "\(link.id) setup timeout")
             self.fail(link)
+        }
+    }
+
+    private func beginServiceDiscovery(for link: CentralLink) {
+        guard !link.setupStarted, !link.ready, link.peripheral.state == .connected else { return }
+        link.setupStarted = true
+        link.peripheral.delegate = self
+        recentlyFailed[link.peripheral.identifier] = nil
+        link.frameSize = min(link.peripheral.maximumWriteValueLength(for: .withResponse), 512)
+        armSetupTimeout(for: link)
+        link.peripheral.discoverServices([serviceUUID])
+    }
+
+    private func resumeRestoredConnections() {
+        for id in Array(restoredPending) {
+            guard let link = links[id] else { restoredPending.remove(id); continue }
+            let peripheral = link.peripheral
+            restoredPending.remove(id)
+            switch peripheral.state {
+            case .connected:
+                beginServiceDiscovery(for: link)
+            case .connecting:
+                armSetupTimeout(for: link)
+            case .disconnected:
+                manager.connect(peripheral, options: nil)
+                armSetupTimeout(for: link)
+            case .disconnecting:
+                armSetupTimeout(for: link)
+            @unknown default:
+                manager.connect(peripheral, options: nil)
+                armSetupTimeout(for: link)
+            }
         }
     }
 
@@ -84,6 +133,7 @@ final class BleCentral: NSObject {
 
     fileprivate func linkClosed(_ link: CentralLink) {
         queue.async { [self] in
+            restoredPending.remove(link.peripheral.identifier)
             if links[link.peripheral.identifier] === link { links[link.peripheral.identifier] = nil }
             manager.cancelPeripheralConnection(link.peripheral)
         }
@@ -97,6 +147,8 @@ final class BleCentral: NSObject {
         fileprivate weak var central: BleCentral?
         fileprivate var rx: CBCharacteristic?
         fileprivate var ready = false
+        fileprivate var setupStarted = false
+        fileprivate var setupTimeoutArmed = false
 
         init(peripheral: CBPeripheral, central: BleCentral) {
             self.peripheral = peripheral; self.central = central
@@ -120,11 +172,22 @@ extension BleCentral: CBCentralManagerDelegate {
         Self.log.info("central state \(central.state.rawValue)")
         onStateChange?(central.state)
         isScanning = false
-        if central.state == .poweredOn { startScanning() }
+        if central.state == .poweredOn {
+            resumeRestoredConnections()
+            startScanning()
+        }
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
-        // Peripherals restored by the system will be reconnected via didConnect if still linked.
+        let restored = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        for peripheral in restored {
+            let link = makeLink(for: peripheral)
+            peripheral.delegate = self
+            restoredPending.insert(peripheral.identifier)
+            Self.log.info("restored peripheral \(peripheral.identifier) state=\(peripheral.state.rawValue)")
+            log.i("central", "restored \(link.id) state=\(peripheral.state.rawValue)")
+        }
+        if central.state == .poweredOn { resumeRestoredConnections() }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
@@ -133,10 +196,9 @@ extension BleCentral: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard let link = links[peripheral.identifier] else { central.cancelPeripheralConnection(peripheral); return }
-        peripheral.delegate = self
-        link.frameSize = min(peripheral.maximumWriteValueLength(for: .withResponse), 512)
-        peripheral.discoverServices([serviceUUID])
+        restoredPending.remove(peripheral.identifier)
+        let link = makeLink(for: peripheral)
+        beginServiceDiscovery(for: link)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {

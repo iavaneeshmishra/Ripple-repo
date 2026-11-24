@@ -104,6 +104,11 @@ struct Identity {
 enum PacketFactory {
     static func build(_ id: Identity, type: PacketType, payload: Data, destination: NodeId = .broadcast, flags: UInt8 = 0,
                       ttl: UInt8 = MeshProtocol.maxTTL, messageId: Data? = nil, timestamp: UInt64? = nil) throws -> Packet {
+        guard ttl <= MeshProtocol.maxTTL else { throw ProtocolError.ttlOutOfRange(ttl) }
+        guard payload.count <= MeshProtocol.maxPayload else { throw ProtocolError.payloadTooLarge }
+        if type == .message && ((flags & Flags.encrypted != 0) == destination.isBroadcast) {
+            throw ProtocolError.messageEncryptionModeMismatch
+        }
         var p = Packet(type: type, flags: flags, ttl: ttl,
                        messageId: messageId ?? Crypto.randomBytes(MeshProtocol.messageIdSize),
                        source: id.nodeId, destination: destination,
@@ -122,8 +127,11 @@ enum PacketFactory {
     }
 
     static func directText(_ id: Identity, to destination: NodeId, recipientWire: Data, text: String) throws -> Packet {
+        let plaintext = Data(text.utf8)
+        let eciesOverhead = 65 + 12 + 16
+        guard plaintext.count <= MeshProtocol.maxPayload - eciesOverhead else { throw ProtocolError.payloadTooLarge }
         let messageId = Crypto.randomBytes(MeshProtocol.messageIdSize)
-        let box = try Crypto.encrypt(recipientWire: recipientWire, messageId: messageId, source: id.nodeId, destination: destination, plaintext: Data(text.utf8))
+        let box = try Crypto.encrypt(recipientWire: recipientWire, messageId: messageId, source: id.nodeId, destination: destination, plaintext: plaintext)
         return try build(id, type: .message, payload: box, destination: destination, flags: Flags.encrypted, messageId: messageId)
     }
 

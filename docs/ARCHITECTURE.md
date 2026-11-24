@@ -35,6 +35,14 @@ so the platforms cannot drift apart.
 | `android/` | Gradle project, Kotlin, Compose, Room, Android Keystore. minSdk 26. |
 | `ios/` | XcodeGen spec (`project.yml`), Swift, SwiftUI, SwiftData, CryptoKit, Keychain. iOS 17+. |
 
+## Local database upgrades
+
+Android Room uses explicit migrations only (`MIGRATION_1_2` currently). There is
+no destructive-migration fallback: if an installed schema version has no migration
+path, opening the database fails rather than silently deleting message history,
+peer pins, SOS history, or relay packets. Every Room schema change must ship and
+verify the needed migration before release.
+
 ## Data flow
 
 **Sending a direct message**
@@ -62,8 +70,9 @@ so the platforms cannot drift apart.
 
 * **Flooding + seen cache** gives loop freedom without routing tables.
 * **TTL = 7** bounds the flood radius.
-* **Store-and-forward**: every non-announce packet is kept for 24 h. When a new
-  neighbour is identified, anything it has not yet been given (addressed to it,
+* **Store-and-forward**: every non-announce packet is kept for up to 72 h
+  (capacity pressure may evict it earlier). When a new neighbour is identified,
+  anything it has not yet been given (addressed to it,
   broadcast, or to a destination we do not know) is replayed. Persisted to Room /
   SwiftData so it survives process death.
 * **Dual role**: every phone is both a central and a peripheral, so any two phones

@@ -44,6 +44,8 @@ data class SosBeacon(
     val timestamp: Long,
 )
 
+data class RelaySnapshot(val packet: Packet, val expiresAt: Long)
+
 interface RouterListener {
     fun onMessage(message: InboundMessage)
     fun onAck(messageId: ByteArray, from: NodeId)
@@ -121,16 +123,23 @@ class MeshRouter(
         saved.forEach { if (!peers.containsKey(it.nodeId.hex)) peers[it.nodeId.hex] = it }
     }
 
-    /** Restore persisted relay-store packets after a restart. */
-    fun importRelayStore(packets: Collection<Packet>): Unit = lock.withLock {
+    /** Restore persisted relay-store entries without extending their original expiry. */
+    fun importRelayStore(entries: Collection<RelaySnapshot>): Unit = lock.withLock {
         val now = clock()
-        packets.forEach { p ->
-            seen[p.messageIdHex] = now
-            relayStore[p.messageIdHex] = RelayEntry(p, now + Protocol.RELAY_TTL_MS)
+        entries.forEach { saved ->
+            if (saved.expiresAt <= now) return@forEach
+            markSeen(saved.packet, now)
+            relayStore[saved.packet.messageIdHex] = RelayEntry(saved.packet, saved.expiresAt)
         }
     }
 
-    fun relayStoreSnapshot(): List<Packet> = lock.withLock { relayStore.values.map { it.packet } }
+    /** Snapshot only live entries, preserving each entry's fixed expiration timestamp. */
+    fun relayStoreSnapshot(): List<RelaySnapshot> = lock.withLock {
+        val now = clock()
+        relayStore.values.mapNotNull { entry ->
+            if (entry.expiresAt > now) RelaySnapshot(entry.packet, entry.expiresAt) else null
+        }
+    }
 
     // ---- outbound -----------------------------------------------------------------
 
@@ -175,7 +184,7 @@ class MeshRouter(
         val now = clock()
         var replayed = 0
         for (entry in relayStore.values) {
-            if (entry.expiresAt < now || peerHex in entry.deliveredTo) continue
+            if (entry.expiresAt <= now || peerHex in entry.deliveredTo) continue
             val dest = entry.packet.destination
             val forPeer = dest.hex == peerId.hex
             val isBroadcast = dest.isBroadcast
@@ -194,9 +203,11 @@ class MeshRouter(
     fun onReceive(link: Link, bytes: ByteArray): Unit = lock.withLock {
         val p = try { Packet.decode(bytes) } catch (_: Exception) { return }
         val now = clock()
-        if (p.timestamp > now + Protocol.SEEN_TTL_MS) return
-        if (seen.containsKey(p.messageIdHex)) return
-        markSeen(p)
+        if (p.timestamp < 0L || p.timestamp > now + Protocol.MAX_FUTURE_SKEW_MS) return
+        if (p.type == PacketType.ACK && (p.destination.isBroadcast || p.payload.size != Protocol.MESSAGE_ID_SIZE)) return
+        purgeExpiredSeen(now)
+        if (seen.containsKey(p.messageIdHex) || relayStore[p.messageIdHex]?.expiresAt?.let { it > now } == true) return
+        markSeen(p, now)
         if (!rateAllows(p)) return // per-source broadcast flood cap (when configured)
 
         if (p.type == PacketType.ANNOUNCE) { handleAnnounce(link, p, now); return }
@@ -232,7 +243,7 @@ class MeshRouter(
                     listener.onMessage(InboundMessage(p.messageId, p.source, peer?.name, text, isBroadcast, verified, p.timestamp))
                     if (forMe) originate(PacketFactory.ack(identity, p.source, p.messageId))
                 }
-                PacketType.ACK -> if (forMe && p.payload.size == Protocol.MESSAGE_ID_SIZE) listener.onAck(p.payload, p.source)
+                PacketType.ACK -> if (forMe && isExpectedAck(p, now)) listener.onAck(p.payload, p.source)
                 PacketType.ANNOUNCE -> {}
                 PacketType.SOS -> {} // handled above
             }
@@ -258,6 +269,16 @@ class MeshRouter(
             onLinkIdentified(link, p.source.hex)
         }
         relay(p, link)
+    }
+
+    /** Accept an ACK only for a live direct message originated by this node and addressed to its signer. */
+    private fun isExpectedAck(ack: Packet, now: Long): Boolean {
+        val original = relayStore[ack.payload.toHex()] ?: return false
+        val message = original.packet
+        return original.expiresAt > now &&
+            message.type == PacketType.MESSAGE && message.isEncrypted &&
+            message.source.hex == selfId.hex && !message.destination.isBroadcast &&
+            message.destination.hex == ack.source.hex
     }
 
     // ---- internals ----------------------------------------------------------------
@@ -298,5 +319,16 @@ class MeshRouter(
         relayStore[p.messageIdHex] = entry
     }
 
-    private fun markSeen(p: Packet) { seen[p.messageIdHex] = clock() }
+    private fun markSeen(p: Packet, at: Long = clock()) {
+        purgeExpiredSeen(at)
+        seen[p.messageIdHex] = at
+    }
+
+    private fun purgeExpiredSeen(now: Long) {
+        val iterator = seen.entries.iterator()
+        while (iterator.hasNext()) {
+            val seenAt = iterator.next().value
+            if (now >= seenAt && now - seenAt >= Protocol.SEEN_TTL_MS) iterator.remove()
+        }
+    }
 }

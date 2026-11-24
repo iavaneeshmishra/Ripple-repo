@@ -34,22 +34,63 @@ private func rippleUncaughtException(_ exception: NSException) {
     CrashLog.record(exception)
 }
 
+@MainActor
+private final class AppStartup: ObservableObject {
+    let mesh: MeshService?
+    let identityFailure: String?
+
+    init(container: ModelContainer) {
+        do {
+            mesh = try MeshService(container: container)
+            identityFailure = nil
+        } catch {
+            mesh = nil
+            identityFailure = error.localizedDescription
+        }
+    }
+}
+
+private struct IdentityUnavailableView: View {
+    let message: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Image(systemName: "key.fill")
+                .font(.largeTitle)
+                .foregroundStyle(.orange)
+            Text("Ripple couldn't securely load your identity")
+                .font(.title2.bold())
+            Text(message)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Text("Mesh networking is stopped to avoid replacing your identity. Unlock the device and reopen Ripple to retry; if the problem continues, contact support.")
+                .font(.footnote)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+}
+
+@MainActor
 @main
 struct RippleApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     private let container: ModelContainer
-    @StateObject private var mesh: MeshService
+    @StateObject private var startup: AppStartup
 
     init() {
         let c = Persistence.container()
         self.container = c
-        self._mesh = StateObject(wrappedValue: MeshService(container: c))
+        self._startup = StateObject(wrappedValue: AppStartup(container: c))
     }
 
     var body: some Scene {
         WindowGroup {
-            HomeView()
-                .environmentObject(mesh)
+            if let mesh = startup.mesh {
+                HomeView().environmentObject(mesh)
+            } else {
+                IdentityUnavailableView(message: startup.identityFailure ?? "Keychain returned an unknown error.")
+            }
         }
         .modelContainer(container)
     }

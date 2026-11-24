@@ -13,7 +13,9 @@ No servers. No accounts. No SIM. The Android app doesn't even request the
 ## Features
 
 - **Multi-hop mesh** — flooding with a seen-cache and TTL, works with any topology.
-- **Store-and-forward** — messages for offline peers are kept for 24 h and delivered when the mesh reconnects (persisted across restarts).
+- **Store-and-forward** — messages for offline peers are kept for up to 72 h and
+  delivered when the mesh reconnects (persisted across restarts; capacity limits
+  may evict earlier).
 - **Public channel + direct chats** — broadcasts reach everyone; direct messages are ECIES-encrypted (P-256 ECDH → HKDF → AES-256-GCM).
 - **Signed everything** — every packet is ECDSA-signed by its originator; forged or tampered packets are dropped.
 - **Delivery receipts** — direct messages get an ACK routed back through the mesh (✓ sent → ✓✓ delivered).
@@ -47,8 +49,8 @@ No servers. No accounts. No SIM. The Android app doesn't even request the
 # Verify the protocol + a simulated 9-node mesh (Node ≥ 18)
 node tools/protocol/test.js
 
-# Android (first time: generate the wrapper, or just open android/ in Android Studio)
-cd android && gradle wrapper --gradle-version 8.9 && ./gradlew testDebugUnitTest installDebug
+# Android (JDK 17 + Android SDK; the checked-in wrapper downloads Gradle 8.9)
+cd android && ./gradlew testDebugUnitTest installDebug
 
 # iOS (macOS with Xcode 15.4+)
 brew install xcodegen && cd ios && xcodegen generate && open Ripple.xcodeproj

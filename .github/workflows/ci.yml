@@ -5,9 +5,9 @@ on:
     branches: ["**"]
   pull_request:
 
+# Read-only by default; build jobs execute repository code from pull requests.
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   protocol:
@@ -15,9 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with: { node-version: 22 }
       - run: node tools/protocol/test.js
+      - name: Release payload dry-run tests
+        run: node tools/release/test.js
       - name: Vectors are up to date (and copies in both apps match)
         run: |
           node tools/protocol/gen-vectors.js && git diff --exit-code protocol/test-vectors.json
@@ -30,16 +34,13 @@ jobs:
     needs: protocol
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v5
-      - name: Bootstrap Gradle wrapper
-        working-directory: android
-        run: |
-          if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.9 --no-daemon
-          fi
       - name: Build and test
+        id: build
         working-directory: android
         run: |
           set -o pipefail
@@ -47,17 +48,69 @@ jobs:
       - name: Summarize errors
         if: always()
         working-directory: android
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
         run: |
           {
             echo "### Android build errors"
             echo '```'
-            grep -E "^e: |error:|FAILED|Test.*FAILED|tests completed|BUILD " gradle.log | sed 's#/home/runner/work/NewRepo/NewRepo/##' | sort -u | head -80
+            if [[ -f gradle.log ]]; then
+              grep -E "^e: |error:|FAILED|Test.*FAILED|tests completed|BUILD |Execution failed|What went wrong" gradle.log | sed 's#/home/runner/work/NewRepo/NewRepo/##' | sort -u | head -80 || true
+            else
+              echo "gradle.log was not produced."
+            fi
             echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY" > android-errors.md
-      - name: Comment errors on PR
-        if: failure() && github.event_name == 'pull_request'
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh pr comment ${{ github.event.pull_request.number }} --body-file android/android-errors.md
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$BUILD_OUTCOME" != "success" && -f gradle.log ]]; then
+            diagnostics="$(python3 - <<'PY'
+          import glob
+          import re
+          import xml.etree.ElementTree as ET
+
+          lines = open("gradle.log", encoding="utf-8", errors="replace").read().splitlines()
+          failure = next((i for i, line in enumerate(lines) if line.startswith("FAILURE: Build failed")), None)
+          if failure is not None:
+              print("\n".join(lines[failure:failure + 70]))
+          else:
+              hits = [i for i, line in enumerate(lines) if re.search(r"(^e: |error:|FAILED|Execution failed|What went wrong|Caused by:|AssertionError|ComparisonFailure)", line)]
+              if hits:
+                  selected = set()
+                  for i in hits[-12:]:
+                      selected.update(range(max(0, i - 1), min(len(lines), i + 5)))
+                  print("\n".join(lines[i] for i in sorted(selected)))
+              else:
+                  print("\n".join(lines[-50:]))
+
+          for report in sorted(glob.glob("app/build/test-results/testDebugUnitTest/TEST-*.xml")):
+              try:
+                  root = ET.parse(report).getroot()
+              except (ET.ParseError, OSError) as error:
+                  print(f"Could not parse {report}: {error}")
+                  continue
+              for case in root.iter("testcase"):
+                  for failure_node in list(case.findall("failure")) + list(case.findall("error")):
+                      detail = (failure_node.attrib.get("message", "") + "\n" + (failure_node.text or "")).strip()
+                      print(f"{case.attrib.get('classname', '')}.{case.attrib.get('name', '')}: {detail[:2500]}")
+          PY
+            )"
+            if [[ -n "$diagnostics" ]]; then
+              diagnostics="${diagnostics:0:8000}"
+              escaped=${diagnostics//%/%25}
+              escaped=${escaped//$'\r'/%0D}
+              escaped=${escaped//$'\n'/%0A}
+              printf '::error title=Android build/test details::%s\n' "$escaped"
+              printf '%s\n' "$diagnostics" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: android-build-diagnostics
+          path: |
+            android/gradle.log
+            android/app/build/test-results/testDebugUnitTest/
+            android/app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v6
         with:
           name: ripple-debug-apk
@@ -69,18 +122,13 @@ jobs:
     needs: protocol
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v5
-      - name: Bootstrap Gradle wrapper
-        working-directory: android
-        run: |
-          if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.9 --no-daemon
-          fi
       # Catches R8/minify breakage on PRs instead of only at tag time. No
-      # signing secrets are referenced here (the release workflow is the only
-      # job that injects RIPPLE_* signing env), so the bundle is unsigned and
+      # signing secrets are referenced here, so the bundle is unsigned and
       # nothing is uploaded to any release.
       - name: Build unsigned release bundle (exercises R8)
         working-directory: android
@@ -119,6 +167,8 @@ jobs:
     needs: protocol
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - run: brew install xcodegen
       - name: Generate project
         working-directory: ios
@@ -150,8 +200,7 @@ jobs:
           xcodebuild test -scheme Ripple -project Ripple.xcodeproj \
             -destination "id=${{ steps.sim.outputs.udid }}" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
-            -resultBundlePath TestResults.xcresult 2>&1 | tee xcodebuild.log | grep -E "error:|Test Case|Test Suite|Executed|BUILD|TEST" || true
-          test ${PIPESTATUS[0]} -eq 0
+            -resultBundlePath TestResults.xcresult 2>&1 | tee xcodebuild.log
           grep -q "Test Suite 'All tests' passed" xcodebuild.log
       - name: Summarize errors
         if: always()
@@ -163,11 +212,7 @@ jobs:
             echo '```'
             grep -E "error:|Executed|Test Suite 'All tests'|\*\* (BUILD|TEST) " xcodebuild.log | sed 's#/Users/runner/work/NewRepo/NewRepo/##' | sort -u | head -80
             echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY" > ios-errors.md
-      - name: Comment errors on PR
-        if: failure() && github.event_name == 'pull_request'
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh pr comment ${{ github.event.pull_request.number }} --body-file ios/ios-errors.md
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         if: always()
         with:

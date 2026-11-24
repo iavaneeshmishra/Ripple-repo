@@ -34,12 +34,16 @@ class MeshRouterTest {
         override fun close() { unlink(owner, remote) }
     }
 
-    private class Node(val name: String, val net: Net) : RouterListener {
+    private class Node(
+        val name: String,
+        val net: Net,
+        clock: () -> Long = System::currentTimeMillis,
+    ) : RouterListener {
         val inbox = ArrayList<InboundMessage>()
         val acks = ArrayList<ByteArray>()
         val sosInbox = ArrayList<SosBeacon>()
         val links = ArrayList<FakeLink>()
-        val router = MeshRouter(Identity.generate(), name, this)
+        val router = MeshRouter(Identity.generate(), name, this, clock = clock)
         override fun onMessage(message: InboundMessage) { inbox.add(message) }
         override fun onAck(messageId: ByteArray, from: NodeId) { acks.add(messageId) }
         override fun onPeersChanged(peers: List<Peer>) {}
@@ -77,6 +81,145 @@ class MeshRouterTest {
         assertFalse(c.inbox.any { it.text == "only for D" })
         assertTrue(a.acks.any { it.contentEquals(id) })
         assertEquals(3, d.router.peer(a.router.selfId)!!.hops)
+    }
+
+    @Test fun `signed unencrypted unicast message is dropped without delivery or ack`() {
+        val net = Net()
+        val a = Node("A", net); val b = Node("B", net)
+        link(a, b); net.settle()
+
+        val broadcast = PacketFactory.broadcastText(a.router.identity, "must not be exposed")
+        val unsigned = broadcast.encodeUnsigned()
+        b.router.selfId.bytes.copyInto(unsigned, 28) // correctly signed, but now unicast with ENCRYPTED clear
+        val wire = unsigned + a.router.identity.sign(unsigned)
+        b.router.onReceive(b.links.first(), wire); net.settle()
+
+        assertFalse(b.inbox.any { it.text == "must not be exposed" })
+        assertFalse(b.router.relayStoreSnapshot().any {
+            it.packet.type == PacketType.ACK && it.packet.payload.contentEquals(broadcast.messageId)
+        })
+    }
+
+    @Test fun `high-bit unsigned timestamp is rejected before delivery or relay`() {
+        val net = Net()
+        val a = Node("A", net); val b = Node("B", net)
+        link(a, b); net.settle()
+
+        val packet = PacketFactory.broadcastText(a.router.identity, "future timestamp")
+        val unsigned = packet.encodeUnsigned()
+        java.nio.ByteBuffer.wrap(unsigned).putLong(36, Long.MIN_VALUE)
+        val wire = unsigned + a.router.identity.sign(unsigned)
+        val linkFromA = b.links.first { it.remote === a }
+        b.router.onReceive(linkFromA, wire); net.settle()
+
+        assertFalse(b.inbox.any { it.text == "future timestamp" })
+        assertFalse(b.router.relayStoreSnapshot().any { it.packet.messageId.contentEquals(packet.messageId) })
+    }
+
+    @Test fun `ack is accepted only from the intended recipient for an owned direct message`() {
+        val net = Net()
+        val a = Node("A", net); val b = Node("B", net); val c = Node("C", net)
+        link(a, b); link(a, c); net.settle()
+
+        val directId = a.router.sendDirect(b.router.selfId, "ack only from B")
+        val linkFromC = a.links.first { it.remote === c }
+        val wrongRecipientAck = PacketFactory.ack(c.router.identity, a.router.selfId, directId)
+        a.router.onReceive(linkFromC, wrongRecipientAck.encode())
+        assertFalse(a.acks.any { it.contentEquals(directId) })
+
+        val orphanAck = PacketFactory.ack(b.router.identity, a.router.selfId, ByteArray(Protocol.MESSAGE_ID_SIZE) { 0x55 })
+        a.router.onReceive(a.links.first { it.remote === b }, orphanAck.encode())
+        assertFalse(a.acks.any { it.contentEquals(orphanAck.payload) })
+
+        val broadcastId = a.router.sendBroadcast("broadcasts are not acked")
+        val broadcastAck = PacketFactory.ack(b.router.identity, a.router.selfId, broadcastId)
+        a.router.onReceive(a.links.first { it.remote === b }, broadcastAck.encode())
+        assertFalse(a.acks.any { it.contentEquals(broadcastId) })
+
+        val ackCountBeforeMalformed = a.acks.size
+        val malformedAck = PacketFactory.ack(b.router.identity, a.router.selfId, ByteArray(Protocol.MESSAGE_ID_SIZE - 1))
+        a.router.onReceive(a.links.first { it.remote === b }, malformedAck.encode())
+        assertEquals(ackCountBeforeMalformed, a.acks.size)
+
+        val validAck = PacketFactory.ack(b.router.identity, a.router.selfId, directId)
+        a.router.onReceive(a.links.first { it.remote === b }, validAck.encode())
+        assertTrue(a.acks.any { it.contentEquals(directId) })
+    }
+
+    @Test fun `future timestamp uses skew limit and rejects one millisecond beyond`() {
+        var now = System.currentTimeMillis()
+        val net = Net()
+        val a = Node("A", net); val b = Node("B", net, clock = { now })
+        link(a, b); net.settle()
+        now = System.currentTimeMillis() + 1_000L
+
+        val atLimit = PacketFactory.build(
+            a.router.identity, PacketType.MESSAGE, "within future skew".toByteArray(),
+            timestamp = now + Protocol.MAX_FUTURE_SKEW_MS,
+        )
+        val beyondLimit = PacketFactory.build(
+            a.router.identity, PacketType.MESSAGE, "beyond future skew".toByteArray(),
+            timestamp = now + Protocol.MAX_FUTURE_SKEW_MS + 1,
+        )
+        val linkFromA = b.links.first { it.remote === a }
+        b.router.onReceive(linkFromA, atLimit.encode()); net.settle()
+        b.router.onReceive(linkFromA, beyondLimit.encode()); net.settle()
+
+        assertTrue(b.inbox.any { it.text == "within future skew" })
+        assertFalse(b.inbox.any { it.text == "beyond future skew" })
+    }
+
+    @Test fun `seen cache suppresses retries for 24 hours then expires`() {
+        var now = System.currentTimeMillis()
+        val net = Net()
+        val a = Node("A", net)
+        val b = Node("B", net, clock = { now })
+        link(a, b); net.settle()
+
+        val packet = PacketFactory.directText(a.router.identity, b.router.selfId, b.router.identity.publicKeyWire, "replay window")
+        val bytes = packet.encode()
+        val linkFromA = b.links.first { it.remote === a }
+        b.router.onReceive(linkFromA, bytes); net.settle()
+        assertEquals(1, b.inbox.count { it.messageId.contentEquals(packet.messageId) })
+
+        now += Protocol.SEEN_TTL_MS - 1
+        b.router.onReceive(linkFromA, bytes); net.settle()
+        assertEquals(1, b.inbox.count { it.messageId.contentEquals(packet.messageId) })
+
+        now += 2
+        b.router.onReceive(linkFromA, bytes); net.settle()
+        assertEquals(2, b.inbox.count { it.messageId.contentEquals(packet.messageId) })
+    }
+
+    @Test fun `live relay entry suppresses duplicates after seen cache expires`() {
+        var now = System.currentTimeMillis()
+        val net = Net()
+        val a = Node("A", net); val b = Node("B", net, clock = { now }); val c = Node("C", net)
+        link(a, b); link(b, c); net.settle()
+
+        val packet = PacketFactory.broadcastText(a.router.identity, "still retained")
+        val bytes = packet.encode()
+        val linkFromA = b.links.first { it.remote === a }
+        b.router.onReceive(linkFromA, bytes); net.settle()
+        assertEquals(1, b.inbox.count { it.messageId.contentEquals(packet.messageId) })
+        assertTrue(b.router.relayStoreSnapshot().any { it.packet.messageId.contentEquals(packet.messageId) })
+
+        now += Protocol.SEEN_TTL_MS + 1
+        b.router.onReceive(linkFromA, bytes); net.settle()
+        assertEquals(1, b.inbox.count { it.messageId.contentEquals(packet.messageId) })
+    }
+
+    @Test fun `expired relay entry is not replayed when a peer reconnects`() {
+        var now = System.currentTimeMillis()
+        val net = Net()
+        val a = Node("A", net); val b = Node("B", net, clock = { now })
+        link(a, b); net.settle()
+        val id = a.router.sendBroadcast("expired relay"); net.settle()
+
+        now += Protocol.RELAY_TTL_MS
+        val c = Node("C", net)
+        link(b, c); net.settle()
+        assertFalse(c.inbox.any { it.messageId.contentEquals(id) })
     }
 
     @Test fun `store and forward delivers after reconnect`() {
@@ -131,7 +274,9 @@ class MeshRouterTest {
         a.router.sendDirect(c.router.selfId, "persisted"); net.settle()
 
         // B "restarts": new router with same identity, imports persisted state.
-        val snapshot = b.router.relayStoreSnapshot().map { Packet.decode(it.encode()) }
+        val snapshot = b.router.relayStoreSnapshot().map { saved ->
+            saved.copy(packet = Packet.decode(saved.packet.encode()))
+        }
         val peersSnapshot = b.router.peers()
         val b2 = Node("B2", net)
         val restored = MeshRouter(b.router.identity, "B", b2)
@@ -146,6 +291,27 @@ class MeshRouterTest {
             if (link.remote === b2) restored.onReceive(link.twin, bytes) else link.remote.router.onReceive(link.twin, bytes)
         }
         assertEquals("persisted", c.inbox.last().text)
+    }
+
+    @Test fun `relay expiry survives snapshot and restore without extension`() {
+        var now = 1_000L
+        val a = Node("A", Net(), clock = { now })
+        val id = a.router.sendBroadcast("expires on schedule")
+        val saved = a.router.relayStoreSnapshot().single { it.packet.messageId.contentEquals(id) }
+        assertEquals(now + Protocol.RELAY_TTL_MS, saved.expiresAt)
+
+        now += 10_000L
+        val restored = Node("restored", Net(), clock = { now })
+        restored.router.importRelayStore(listOf(saved))
+        val imported = restored.router.relayStoreSnapshot().single()
+        assertEquals(saved.expiresAt, imported.expiresAt)
+        assertEquals(Protocol.RELAY_TTL_MS - 10_000L, imported.expiresAt - now)
+
+        now = saved.expiresAt
+        assertTrue(restored.router.relayStoreSnapshot().isEmpty())
+        val afterExpiry = Node("after expiry", Net(), clock = { now })
+        afterExpiry.router.importRelayStore(listOf(saved))
+        assertTrue(afterExpiry.router.relayStoreSnapshot().isEmpty())
     }
 
     // ---- Phase 2: SOS beacons, rate limiting, 72 h store-and-forward, battery profiles ----

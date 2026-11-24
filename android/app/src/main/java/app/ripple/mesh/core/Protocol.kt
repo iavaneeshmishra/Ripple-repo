@@ -11,13 +11,16 @@ object Protocol {
     const val HEADER_SIZE = 46
     const val SIGNATURE_SIZE = 64
     const val MAX_PACKET = HEADER_SIZE + MAX_PAYLOAD + SIGNATURE_SIZE
+    const val MAX_REASSEMBLY_STREAMS = 8
+    const val MAX_REASSEMBLY_BYTES = 32 * 1024
     const val MAX_NAME_BYTES = 64
     const val NODE_ID_SIZE = 8
     const val MESSAGE_ID_SIZE = 16
     val HKDF_INFO: ByteArray = "ripple/v1/msg".toByteArray(Charsets.UTF_8)
 
     const val SEEN_TTL_MS = 24L * 3600 * 1000
-    // Store-and-forward guarantee: relayed packets are held for 72 h.
+    const val MAX_FUTURE_SKEW_MS = 24L * 3600 * 1000
+    // Relay-store expiry is a maximum retention age; capacity pressure can evict earlier.
     const val RELAY_TTL_MS = 72L * 3600 * 1000
     const val REASSEMBLY_TTL_MS = 10_000L
 
@@ -142,13 +145,16 @@ data class Packet(
     init {
         require(messageId.size == Protocol.MESSAGE_ID_SIZE)
         require(payload.size <= Protocol.MAX_PAYLOAD)
-        require(ttl in 0..255)
+        require(ttl in 0..Protocol.MAX_TTL) { "ttl out of range" }
     }
 
     fun withTtl(newTtl: Int): Packet = copy(ttl = newTtl)
 
     /** Header + payload, without signature. */
     fun encodeUnsigned(): ByteArray {
+        if (type == PacketType.MESSAGE && isEncrypted == destination.isBroadcast) {
+            throw ProtocolException("message encryption mode does not match destination")
+        }
         val buf = ByteBuffer.allocate(Protocol.HEADER_SIZE + payload.size)
         buf.put(Protocol.VERSION.toByte())
         buf.put(type.code.toByte())
@@ -186,16 +192,21 @@ data class Packet(
             val type = PacketType.from(buf.get().toInt() and 0xff) ?: throw ProtocolException("unknown type")
             val flags = buf.get().toInt() and 0xff
             val ttl = buf.get().toInt() and 0xff
+            if (ttl > Protocol.MAX_TTL) throw ProtocolException("ttl out of range")
             val messageId = ByteArray(Protocol.MESSAGE_ID_SIZE).also { buf.get(it) }
             val source = ByteArray(Protocol.NODE_ID_SIZE).also { buf.get(it) }
             val destination = ByteArray(Protocol.NODE_ID_SIZE).also { buf.get(it) }
+            val destinationId = NodeId(destination)
+            if (type == PacketType.MESSAGE && ((flags and Flags.ENCRYPTED != 0) == destinationId.isBroadcast)) {
+                throw ProtocolException("message encryption mode does not match destination")
+            }
             val timestamp = buf.getLong()
             val payloadLength = buf.getShort().toInt() and 0xffff
             if (payloadLength > Protocol.MAX_PAYLOAD) throw ProtocolException("payload too large")
             if (bytes.size != Protocol.HEADER_SIZE + payloadLength + Protocol.SIGNATURE_SIZE) throw ProtocolException("length mismatch")
             val payload = ByteArray(payloadLength).also { buf.get(it) }
             val signature = ByteArray(Protocol.SIGNATURE_SIZE).also { buf.get(it) }
-            return Packet(type, flags, ttl, messageId, NodeId(source), NodeId(destination), timestamp, payload, signature)
+            return Packet(type, flags, ttl, messageId, NodeId(source), destinationId, timestamp, payload, signature)
         }
     }
 }

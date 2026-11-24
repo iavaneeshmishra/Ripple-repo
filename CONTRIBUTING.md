@@ -15,13 +15,13 @@ Thanks for helping build messaging that works when nothing else does.
 ## Getting set up
 
 ```bash
-git clone https://github.com/iavaneeshmishra/NewRepo ripple && cd ripple
+git clone https://github.com/iavaneeshmishra/Ripple-repo.git ripple && cd ripple
 
 # Protocol reference (no toolchain beyond Node 18+)
 node tools/protocol/test.js
 
-# Android — open android/ in Android Studio (Hedgehog or newer), or:
-cd android && gradle wrapper --gradle-version 8.9 && ./gradlew testDebugUnitTest installDebug
+# Android — open android/ in Android Studio (Hedgehog or newer), or use the checked-in Gradle 8.9 wrapper:
+cd android && ./gradlew testDebugUnitTest installDebug
 
 # iOS — Xcode 15.4+
 brew install xcodegen && cd ios && xcodegen generate && open Ripple.xcodeproj
@@ -73,9 +73,9 @@ rarely enough to understand a BLE problem.
 
 ## Security issues
 
-If you find a vulnerability in the protocol or crypto, please open a **draft security
-advisory** on GitHub rather than a public issue, or email the maintainer listed in the
-repository profile. We'll credit you in the fix.
+If you find a vulnerability in the protocol or crypto, use the private reporting
+process in [SECURITY.md](SECURITY.md). Do not post exploit details in a public issue
+or discussion. Reporter credit is welcome but optional.
 
 ## License
 

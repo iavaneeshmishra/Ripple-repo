@@ -39,7 +39,12 @@ abstract class BleLink(override val id: String, private val onPacket: (BleLink, 
     fun start() { writer.start() }
 
     override fun send(packetBytes: ByteArray) {
-        if (!closed.get()) outbound.offer(packetBytes)
+        if (closed.get()) return
+        if (!Fragmenter.canFragment(packetBytes.size, frameSize)) {
+            log.w("link", "$id dropping packet: ${packetBytes.size} B cannot fit in $frameSize-byte frames")
+            return
+        }
+        outbound.offer(packetBytes)
     }
 
     /** Called by the subclass for every frame received from the radio. */
@@ -55,7 +60,13 @@ abstract class BleLink(override val id: String, private val onPacket: (BleLink, 
             while (!closed.get()) {
                 val packet = outbound.take()
                 val streamId = Random.nextInt(0, 0x10000)
-                for (frame in Fragmenter.fragment(packet, frameSize, streamId)) {
+                val frames = try {
+                    Fragmenter.fragment(packet, frameSize, streamId)
+                } catch (e: IllegalArgumentException) {
+                    log.w("link", "$id dropping packet after frame-size change: ${e.message}")
+                    continue
+                }
+                for (frame in frames) {
                     if (closed.get()) return
                     if (!writeFrame(frame)) { log.w("link", "$id write failed; closing"); close(); return }
                     bytesOut += frame.size; lastActivity = System.currentTimeMillis()

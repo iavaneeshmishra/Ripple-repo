@@ -61,10 +61,10 @@ final class MeshService: ObservableObject, RouterListener {
         }
     }
 
-    init(container: ModelContainer) {
+    init(container: ModelContainer) throws {
         self.previousCrash = CrashLog.takePending()
         self.container = container
-        let identity = IdentityStore.load()
+        let identity = try IdentityStore.load()
         let name = IdentityStore.displayName ?? "Ripple \(identity.nodeId.short)"
         displayName = name
         router = MeshRouter(identity: identity, displayName: name, listener: nil)
@@ -116,9 +116,13 @@ final class MeshService: ObservableObject, RouterListener {
         }
         let now = Date()
         if let packets = try? ctx.fetch(FetchDescriptor<RelayPacketRecord>()) {
-            var live: [Packet] = []
+            var live: [RelaySnapshot] = []
             for r in packets {
-                if r.expiresAt <= now { ctx.delete(r) } else if let p = try? Packet.decode(r.bytes) { live.append(p) }
+                if r.expiresAt <= now {
+                    ctx.delete(r)
+                } else if let p = try? Packet.decode(r.bytes) {
+                    live.append(RelaySnapshot(packet: p, expiresAt: r.expiresAt))
+                }
             }
             router.importRelayStore(live)
         }
@@ -128,11 +132,20 @@ final class MeshService: ObservableObject, RouterListener {
 
     private func persistRelayStore() {
         let ctx = container.mainContext
-        let expires = Date().addingTimeInterval(MeshProtocol.relayTTL)
-        for p in router.relayStoreSnapshot() {
-            let id = p.messageIdHex
-            let existing = try? ctx.fetch(FetchDescriptor<RelayPacketRecord>(predicate: #Predicate { $0.messageId == id })).first
-            if existing == nil { ctx.insert(RelayPacketRecord(messageId: id, bytes: p.encode(), expiresAt: expires)) }
+        let now = Date()
+        if let expired = try? ctx.fetch(FetchDescriptor<RelayPacketRecord>(predicate: #Predicate { $0.expiresAt <= now })) {
+            expired.forEach { ctx.delete($0) }
+        }
+        for saved in router.relayStoreSnapshot() where saved.expiresAt > now {
+            let packet = saved.packet
+            let id = packet.messageIdHex
+            let fetched = try? ctx.fetch(FetchDescriptor<RelayPacketRecord>(predicate: #Predicate { $0.messageId == id }))
+            if let existing = fetched?.first {
+                existing.bytes = packet.encode()
+                existing.expiresAt = saved.expiresAt
+            } else {
+                ctx.insert(RelayPacketRecord(messageId: id, bytes: packet.encode(), expiresAt: saved.expiresAt))
+            }
         }
         try? ctx.save()
     }
@@ -181,7 +194,13 @@ final class MeshService: ObservableObject, RouterListener {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let id = messageId.hex
-            if let rec = try? self.container.mainContext.fetch(FetchDescriptor<MessageRecord>(predicate: #Predicate { $0.messageId == id })).first {
+            let peerId = from.hex
+            let localNodeId = self.router.selfId.hex
+            if let rec = try? self.container.mainContext.fetch(FetchDescriptor<MessageRecord>(predicate: #Predicate { $0.messageId == id })).first,
+               rec.outgoing,
+               rec.fromNodeId == localNodeId,
+               rec.conversation == peerId,
+               (rec.status == .pending || rec.status == .sent) {
                 rec.status = .delivered
                 try? self.container.mainContext.save()
             }

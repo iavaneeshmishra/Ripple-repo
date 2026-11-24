@@ -36,11 +36,38 @@ class ProtocolVectorsTest {
     private val alice by lazy { identityFromScalar(v.getJSONObject("identities").getJSONObject("alice").getString("privateScalar")) }
     private val bob by lazy { identityFromScalar(v.getJSONObject("identities").getJSONObject("bob").getString("privateScalar")) }
 
+    private fun fragmentFrame(streamId: Int, index: Int, total: Int, payload: ByteArray = ByteArray(0)): ByteArray {
+        val frame = ByteArray(Fragmenter.HEADER + payload.size)
+        frame[0] = (streamId ushr 8).toByte(); frame[1] = streamId.toByte()
+        frame[2] = index.toByte(); frame[3] = total.toByte()
+        payload.copyInto(frame, Fragmenter.HEADER)
+        return frame
+    }
+
     @Test fun `node ids match`() {
         val ids = v.getJSONObject("identities")
         assertEquals(ids.getJSONObject("alice").getString("nodeId"), alice.nodeId.hex)
         assertEquals(ids.getJSONObject("bob").getString("nodeId"), bob.nodeId.hex)
         assertEquals(ids.getJSONObject("alice").getString("display"), alice.nodeId.display)
+    }
+
+    @Test fun `outbound payload and ECIES overhead limits are enforced`() {
+        val maxDirectTextBytes = Protocol.MAX_PAYLOAD - (65 + 12 + 16)
+        val maximumBroadcast = PacketFactory.broadcastText(alice, "x".repeat(Protocol.MAX_PAYLOAD))
+        assertEquals(Protocol.MAX_PAYLOAD, maximumBroadcast.payload.size)
+        val directText = "x".repeat(maxDirectTextBytes - 3) + "€"
+        assertEquals(maxDirectTextBytes, directText.toByteArray(Charsets.UTF_8).size)
+        val maximumDirect = PacketFactory.directText(alice, bob.nodeId, bob.publicKeyWire, directText)
+        assertEquals(Protocol.MAX_PAYLOAD, maximumDirect.payload.size)
+
+        try {
+            PacketFactory.broadcastText(alice, "x".repeat(Protocol.MAX_PAYLOAD + 1))
+            fail("oversized broadcast payload should be rejected")
+        } catch (_: IllegalArgumentException) {}
+        try {
+            PacketFactory.directText(alice, bob.nodeId, bob.publicKeyWire, directText + "x")
+            fail("oversized ECIES plaintext should be rejected before encryption")
+        } catch (_: IllegalArgumentException) {}
     }
 
     @Test fun `private scalars really match the public keys`() {
@@ -141,13 +168,126 @@ class ProtocolVectorsTest {
         assertEquals(small.getJSONArray("frames").getString(0), sf.single().toHex())
     }
 
+    @Test fun `fragmentation and reassembly reject packets above MAX_PACKET`() {
+        assertEquals(16 * Fragmenter.MAX_FRAGMENTS, Fragmenter.maxPacketSize(20))
+        assertTrue(Fragmenter.canFragment(16 * Fragmenter.MAX_FRAGMENTS, 20))
+        assertFalse(Fragmenter.canFragment(16 * Fragmenter.MAX_FRAGMENTS + 1, 20))
+        assertEquals(Protocol.MAX_PACKET, Fragmenter.maxPacketSize(23))
+        assertTrue(Fragmenter.canFragment(Protocol.MAX_PACKET, 23))
+        val maxPacket = ByteArray(Protocol.MAX_PACKET) { it.toByte() }
+        val legacyFrames = Fragmenter.fragment(ByteArray(16 * Fragmenter.MAX_FRAGMENTS), frameSize = 20, streamId = 3)
+        assertEquals(255, legacyFrames.size)
+        assertTrue(legacyFrames.all { it.size <= 20 })
+        val fullFrames = Fragmenter.fragment(maxPacket, frameSize = 23, streamId = 4)
+        assertEquals(222, fullFrames.size)
+        assertTrue(fullFrames.all { it.size <= 23 })
+        var rebuilt: ByteArray? = null
+        val reassembler = Reassembler()
+        fullFrames.forEach { reassembler.push(it)?.let { packet -> rebuilt = packet } }
+        assertArrayEquals(maxPacket, rebuilt!!)
+        try {
+            Fragmenter.fragment(ByteArray(16 * Fragmenter.MAX_FRAGMENTS + 1), frameSize = 20, streamId = 1)
+            fail("packet too large for a legacy MTU should not be fragmented")
+        } catch (_: IllegalArgumentException) {}
+        try {
+            Fragmenter.fragment(ByteArray(Protocol.MAX_PACKET + 1), frameSize = 512, streamId = 1)
+            fail("oversized packet should not be fragmented")
+        } catch (_: IllegalArgumentException) {}
+
+        val r = Reassembler()
+        assertNull(r.push(fragmentFrame(1, 0, 1, ByteArray(Protocol.MAX_PACKET + 1))))
+
+        val multipart = Reassembler()
+        assertNull(multipart.push(fragmentFrame(2, 0, 2, ByteArray(Protocol.MAX_PACKET))))
+        assertNull(multipart.push(fragmentFrame(2, 1, 2, byteArrayOf(1))))
+    }
+
+    @Test fun `reassembly caps active streams and aggregate buffered bytes`() {
+        var now = 0L
+        val capped = Reassembler(clock = { now })
+        for (id in 0 until Protocol.MAX_REASSEMBLY_STREAMS) {
+            assertNull(capped.push(fragmentFrame(id, 0, 2, byteArrayOf(id.toByte()))))
+        }
+        assertNull(capped.push(fragmentFrame(99, 0, 2, byteArrayOf(99))))
+        assertNull(capped.push(fragmentFrame(99, 1, 2, byteArrayOf(100))))
+        assertArrayEquals(byteArrayOf(0, 1), capped.push(fragmentFrame(0, 1, 2, byteArrayOf(1)))!!)
+        assertNull(capped.push(fragmentFrame(99, 0, 2, byteArrayOf(99))))
+        assertArrayEquals(byteArrayOf(99, 100), capped.push(fragmentFrame(99, 1, 2, byteArrayOf(100)))!!)
+
+        var adversarialNow = 0L
+        val worstCase = Reassembler(ttlMs = 1_000L, clock = { adversarialNow })
+        for (id in 0 until Protocol.MAX_REASSEMBLY_STREAMS) {
+            assertNull(worstCase.push(fragmentFrame(id, 0, 255)))
+        }
+        assertNull(worstCase.push(fragmentFrame(99, 0, 2, byteArrayOf(99))))
+        assertNull(worstCase.push(fragmentFrame(99, 1, 2, byteArrayOf(100))))
+        adversarialNow = 1_000L
+        assertNull(worstCase.push(fragmentFrame(100, 0, 2, byteArrayOf(10))))
+        assertArrayEquals(byteArrayOf(10, 11), worstCase.push(fragmentFrame(100, 1, 2, byteArrayOf(11)))!!)
+
+        val buffered = Reassembler(clock = { now })
+        val maxPart = ByteArray(Protocol.MAX_PACKET) { 0x61.toByte() }
+        for (id in 0 until 7) assertNull(buffered.push(fragmentFrame(id, 0, 2, maxPart)))
+        val remaining = Protocol.MAX_REASSEMBLY_BYTES - 7 * Protocol.MAX_PACKET
+        val lastPart = ByteArray(remaining) { 0x62.toByte() }
+        assertNull(buffered.push(fragmentFrame(7, 0, 2, lastPart)))
+        assertArrayEquals(lastPart, buffered.push(fragmentFrame(7, 1, 2))!!)
+
+        assertNull(buffered.push(fragmentFrame(7, 0, 2, lastPart)))
+        assertNull(buffered.push(fragmentFrame(7, 1, 2, byteArrayOf(0x63))))
+        assertArrayEquals(maxPart, buffered.push(fragmentFrame(0, 1, 2))!!)
+        assertNull(buffered.push(fragmentFrame(7, 1, 2, byteArrayOf(0x63))))
+        val expected = lastPart + byteArrayOf(0x63)
+        assertArrayEquals(expected, buffered.push(fragmentFrame(7, 0, 2, lastPart))!!)
+    }
+
+    @Test fun `reassembly expires partial streams at a fixed deadline`() {
+        var now = 0L
+        val r = Reassembler(ttlMs = 1_000L, clock = { now })
+        assertNull(r.push(fragmentFrame(1, 0, 2, byteArrayOf(1))))
+        now = 999L
+        assertArrayEquals(byteArrayOf(1, 2), r.push(fragmentFrame(1, 1, 2, byteArrayOf(2)))!!)
+        now = 2_000L
+        assertNull(r.push(fragmentFrame(2, 0, 2, byteArrayOf(3))))
+        now = 3_000L
+        assertNull(r.push(fragmentFrame(2, 1, 2, byteArrayOf(4))))
+        now = 3_001L
+        assertArrayEquals(byteArrayOf(5, 4), r.push(fragmentFrame(2, 0, 2, byteArrayOf(5)))!!)
+    }
+
+    @Test fun `high-bit timestamp vector preserves unsigned wire bits`() {
+        val high = v.getJSONObject("highBitTimestamp")
+        val packet = Packet.decode(high.getString("fullPacket").hexToBytes())
+        assertEquals(Long.MIN_VALUE, packet.timestamp)
+        assertArrayEquals(high.getString("fullPacket").hexToBytes(), packet.encode())
+        assertTrue(Crypto.verify(alice.publicKey, packet.encodeUnsigned(), packet.signature))
+    }
+
     @Test fun `invalid packets are rejected`() {
         val bad = v.getJSONObject("invalid")
-        for (key in listOf("wrongVersion", "truncated")) {
+        for (key in listOf("wrongVersion", "truncated", "ttl8", "ttl255", "directWithoutEncryption", "broadcastWithEncryption")) {
             try { Packet.decode(bad.getString(key).hexToBytes()); fail("$key should not decode") } catch (_: ProtocolException) {}
         }
         val tampered = Packet.decode(bad.getString("tamperedPayload").hexToBytes())
         assertFalse(Crypto.verify(alice.publicKey, tampered.encodeUnsigned(), tampered.signature))
+    }
+
+    @Test fun `packet creation rejects MESSAGE encryption mode mismatches`() {
+        try {
+            PacketFactory.build(alice, PacketType.MESSAGE, byteArrayOf(1), destination = bob.nodeId)
+            fail("a unicast MESSAGE must be encrypted")
+        } catch (_: ProtocolException) {}
+        try {
+            PacketFactory.build(alice, PacketType.MESSAGE, byteArrayOf(1), flags = Flags.ENCRYPTED)
+            fail("a broadcast MESSAGE must not be encrypted")
+        } catch (_: ProtocolException) {}
+    }
+
+    @Test fun `packet creation rejects ttl above MAX_TTL`() {
+        try {
+            PacketFactory.build(alice, PacketType.MESSAGE, byteArrayOf(1), ttl = Protocol.MAX_TTL + 1)
+            fail("ttl above MAX_TTL should not be encoded")
+        } catch (_: IllegalArgumentException) {}
     }
 
     // ---- Phase 2: SOS beacon payload (PROTOCOL.md §2.2) --------------------------------

@@ -11,6 +11,12 @@ const MAX_TTL = 7;
 const MAX_PAYLOAD = 4096;
 const HEADER_SIZE = 46;
 const SIGNATURE_SIZE = 64;
+const MAX_PACKET = HEADER_SIZE + MAX_PAYLOAD + SIGNATURE_SIZE;
+const MAX_REASSEMBLY_STREAMS = 8;
+const MAX_REASSEMBLY_BYTES = 32 * 1024;
+const REASSEMBLY_TTL_MS = 10_000;
+const SEEN_TTL_MS = 24 * 3600 * 1000;
+const MAX_FUTURE_SKEW_MS = 24 * 3600 * 1000;
 const HKDF_INFO = Buffer.from('ripple/v1/msg', 'utf8');
 const BROADCAST_ID = Buffer.alloc(8, 0);
 
@@ -24,7 +30,7 @@ const SOS_FLAG_HAS_LOCATION = 0x01;
 // Battery-dependent relay policies (PROTOCOL.md §7).
 const BatteryProfile = Object.freeze({ PERFORMANCE: 0, BALANCED: 1, POWER_SAVER: 2 });
 
-/** Store-and-forward guarantee: relayed packets are held for 72 h (PROTOCOL.md §6). */
+/** Maximum relay-store age is 72 h; capacity pressure may evict earlier (PROTOCOL.md §6). */
 const RELAY_RETENTION_MS = 72 * 3600 * 1000;
 
 /**
@@ -105,7 +111,11 @@ function formatNodeId(id) {
  */
 
 function encodeUnsigned(p) {
+  if (!Number.isInteger(p.ttl) || p.ttl < 0 || p.ttl > MAX_TTL) throw new Error('ttl out of range');
   if (p.payload.length > MAX_PAYLOAD) throw new Error('payload too large');
+  if (p.type === PacketType.MESSAGE && Boolean(p.flags & Flags.ENCRYPTED) === p.destination.equals(BROADCAST_ID)) {
+    throw new Error('message encryption mode does not match destination');
+  }
   const buf = Buffer.alloc(HEADER_SIZE + p.payload.length);
   buf[0] = p.version;
   buf[1] = p.type;
@@ -154,14 +164,20 @@ function encode(p) {
 function decode(buf) {
   if (buf.length < HEADER_SIZE + SIGNATURE_SIZE) throw new Error('packet too short');
   if (buf[0] !== VERSION) throw new Error('unsupported version');
+  if (buf[3] > MAX_TTL) throw new Error('ttl out of range');
+  const type = buf[1], flags = buf[2];
+  const destination = Buffer.from(buf.subarray(28, 36));
+  if (type === PacketType.MESSAGE && Boolean(flags & Flags.ENCRYPTED) === destination.equals(BROADCAST_ID)) {
+    throw new Error('message encryption mode does not match destination');
+  }
   const payloadLength = buf.readUInt16BE(44);
   if (payloadLength > MAX_PAYLOAD) throw new Error('payload too large');
   if (buf.length !== HEADER_SIZE + payloadLength + SIGNATURE_SIZE) throw new Error('length mismatch');
   return {
-    version: buf[0], type: buf[1], flags: buf[2], ttl: buf[3],
+    version: buf[0], type, flags, ttl: buf[3],
     messageId: Buffer.from(buf.subarray(4, 20)),
     source: Buffer.from(buf.subarray(20, 28)),
-    destination: Buffer.from(buf.subarray(28, 36)),
+    destination,
     timestamp: buf.readBigUInt64BE(36),
     payload: Buffer.from(buf.subarray(HEADER_SIZE, HEADER_SIZE + payloadLength)),
     signature: Buffer.from(buf.subarray(HEADER_SIZE + payloadLength)),
@@ -170,6 +186,7 @@ function decode(buf) {
 
 /** Build + sign a packet from the given identity. */
 function buildPacket(identity, { type, flags = 0, ttl = MAX_TTL, messageId, destination = BROADCAST_ID, timestamp, payload }) {
+  if (!Number.isInteger(ttl) || ttl < 0 || ttl > MAX_TTL) throw new Error('ttl out of range');
   const p = {
     version: VERSION, type, flags, ttl,
     messageId: messageId || crypto.randomBytes(16),
@@ -315,9 +332,11 @@ class RateLimiter {
 // ---------------------------------------------------------------- fragments -
 
 function fragment(packetBytes, frameSize, streamId) {
+  if (packetBytes.length > MAX_PACKET) throw new Error('packet too large');
+  if (!Number.isInteger(frameSize) || frameSize <= 4) throw new Error('frame too small');
+  if (!Number.isInteger(streamId) || streamId < 0 || streamId > 0xffff) throw new Error('stream id out of range');
   const chunkSize = frameSize - 4;
-  if (chunkSize < 1) throw new Error('frame too small');
-  const total = Math.ceil(packetBytes.length / chunkSize) || 1;
+  const total = packetBytes.length === 0 ? 1 : 1 + Math.floor((packetBytes.length - 1) / chunkSize);
   if (total > 255) throw new Error('packet needs too many fragments');
   const frames = [];
   for (let i = 0; i < total; i++) {
@@ -330,23 +349,86 @@ function fragment(packetBytes, frameSize, streamId) {
 }
 
 class Reassembler {
-  constructor(ttlMs = 10_000) { this.streams = new Map(); this.ttlMs = ttlMs; }
+  constructor(ttlMs = REASSEMBLY_TTL_MS) {
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error('reassembly ttl must be positive');
+    this.streams = new Map();
+    this.ttlMs = ttlMs;
+    this.bufferedBytes = 0;
+  }
+
+  _removeStream(streamId) {
+    const stream = this.streams.get(streamId);
+    if (stream) {
+      this.streams.delete(streamId);
+      this.bufferedBytes -= stream.bufferedBytes;
+    }
+  }
+
+  _removeExpired(now) {
+    for (const [streamId, stream] of this.streams) {
+      if (now - stream.startedAt >= this.ttlMs) this._removeStream(streamId);
+    }
+  }
+
   /** @returns {Buffer|null} full packet when complete */
-  push(frame, now = Date.now()) {
+  push(frame, now = Number(process.hrtime.bigint() / 1_000_000n)) {
+    // Expire even when the incoming frame is malformed so stale allocations are
+    // reclaimed on the next link activity.
+    this._removeExpired(now);
     if (frame.length < 4) return null;
     const streamId = frame.readUInt16BE(0), index = frame[2], total = frame[3];
     if (total === 0 || index >= total) return null;
-    for (const [k, s] of this.streams) if (now - s.startedAt > this.ttlMs) this.streams.delete(k);
-    let s = this.streams.get(streamId);
-    if (!s || s.total !== total) { s = { total, parts: new Array(total), have: 0, startedAt: now }; this.streams.set(streamId, s); }
-    if (!s.parts[index]) { s.parts[index] = Buffer.from(frame.subarray(4)); s.have++; }
-    if (s.have === total) { this.streams.delete(streamId); return Buffer.concat(s.parts); }
-    return null;
+
+    const partSize = frame.length - 4;
+    if (partSize > MAX_PACKET) {
+      this._removeStream(streamId);
+      return null;
+    }
+
+    let stream = this.streams.get(streamId);
+    if (stream && stream.total !== total) {
+      this._removeStream(streamId);
+      stream = null;
+    }
+
+    // Complete packets need no retained stream or active-stream slot.
+    if (total === 1) {
+      this._removeStream(streamId);
+      return Buffer.from(frame.subarray(4));
+    }
+
+    if (!stream) {
+      if (this.streams.size >= MAX_REASSEMBLY_STREAMS) return null;
+      stream = { total, parts: new Array(total), have: 0, startedAt: now, bufferedBytes: 0 };
+      this.streams.set(streamId, stream);
+    }
+
+    if (stream.parts[index]) return null;
+    if (partSize > MAX_PACKET - stream.bufferedBytes ||
+        partSize > MAX_REASSEMBLY_BYTES - this.bufferedBytes) {
+      // Drop the whole stream rather than pinning a partial allocation at the cap.
+      this._removeStream(streamId);
+      return null;
+    }
+
+    const part = Buffer.from(frame.subarray(4));
+    stream.parts[index] = part;
+    stream.have++;
+    stream.bufferedBytes += part.length;
+    this.bufferedBytes += part.length;
+    if (stream.have < total) return null;
+
+    const packet = Buffer.concat(stream.parts);
+    this._removeStream(streamId);
+    return packet;
   }
 }
 
 module.exports = {
-  VERSION, MAX_TTL, MAX_PAYLOAD, HEADER_SIZE, SIGNATURE_SIZE, BROADCAST_ID, PacketType, Flags,
+  VERSION, MAX_TTL, MAX_PAYLOAD, HEADER_SIZE, SIGNATURE_SIZE, MAX_PACKET,
+  MAX_REASSEMBLY_STREAMS, MAX_REASSEMBLY_BYTES, REASSEMBLY_TTL_MS,
+  SEEN_TTL_MS, MAX_FUTURE_SKEW_MS,
+  BROADCAST_ID, PacketType, Flags,
   MAX_SOS_TEXT, SOS_FLAG_HAS_LOCATION, BatteryProfile, RELAY_RETENTION_MS, relaysOrdinary,
   generateIdentity, identityFromPrivateScalar, publicKeyWire, publicKeyFromWire, nodeIdFromPublicKey, formatNodeId,
   encodeUnsigned, signingDigest, signingInput, sign, verify, encode, decode, buildPacket,

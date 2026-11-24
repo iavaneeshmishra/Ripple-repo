@@ -378,3 +378,7 @@ ios/DerivedData/
 ios/**/xcuserdata/
 # Node
 node_modules/
+
+# Checked-in tagged-release preparation tooling (not generated Release output)
+!tools/release/
+!tools/release/**

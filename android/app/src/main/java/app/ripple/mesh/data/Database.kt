@@ -71,8 +71,13 @@ interface MessageDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(message: MessageEntity)
 
-    @Query("UPDATE messages SET status = :status WHERE messageId = :messageId")
-    suspend fun setStatus(messageId: String, status: MessageStatus)
+    @Query(
+        """UPDATE messages SET status = 'DELIVERED'
+           WHERE messageId = :messageId AND outgoing = 1
+             AND conversation = :conversation AND fromNodeId = :localNodeId
+             AND status IN ('PENDING', 'SENT')"""
+    )
+    suspend fun markDeliveredByAck(messageId: String, conversation: String, localNodeId: String): Int
 
     @Query("SELECT * FROM messages WHERE conversation = :conversation ORDER BY timestamp ASC")
     fun observeConversation(conversation: String): Flow<List<MessageEntity>>
@@ -169,7 +174,9 @@ abstract class RippleDatabase : RoomDatabase() {
         fun get(context: Context): RippleDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, RippleDatabase::class.java, "ripple.db")
                 .addMigrations(MIGRATION_1_2)
-                .fallbackToDestructiveMigration().build().also { instance = it }
+                // Never silently erase messages, peers, or relay packets for an unknown schema version.
+                // Ship an explicit Migration with each schema change instead.
+                .build().also { instance = it }
         }
     }
 }

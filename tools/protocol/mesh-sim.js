@@ -22,7 +22,7 @@ class MeshRouter {
     this.seen = new Map();        // hex(messageId) -> firstSeenAt
     this.relayStore = new Map();  // hex(messageId) -> { packet, expiresAt, deliveredTo:Set<hexNodeId> }
     this.maxSeen = 5000; this.maxRelay = 500;
-    this.ttlMs = 24 * 3600 * 1000;                 // out-of-band clock tolerance / dedupe horizon
+    this.futureSkewMs = R.MAX_FUTURE_SKEW_MS;
     this.relayRetentionMs = R.RELAY_RETENTION_MS; // store-and-forward window (72 h)
     this.batteryProfile = R.BatteryProfile.BALANCED;
     this.inboundRate = null;                       // RateLimiter per inbound broadcast source once enabled
@@ -67,8 +67,10 @@ class MeshRouter {
   sendDirectText(destination, text) {
     const peer = this.peers.get(destination.toString('hex'));
     if (!peer) throw new Error('unknown peer; no public key');
+    const plaintext = Buffer.from(text, 'utf8');
+    if (plaintext.length > R.MAX_PAYLOAD - (65 + 12 + 16)) throw new Error('payload too large');
     const messageId = crypto.randomBytes(16);
-    const payload = R.eciesEncrypt({ recipientWire: peer.publicKeyWire, messageId, source: this.selfId, destination, plaintext: Buffer.from(text, 'utf8') });
+    const payload = R.eciesEncrypt({ recipientWire: peer.publicKeyWire, messageId, source: this.selfId, destination, plaintext });
     return this.originate(R.buildPacket(this.identity, { type: R.PacketType.MESSAGE, flags: R.Flags.ENCRYPTED, messageId, destination, payload }));
   }
 
@@ -113,10 +115,11 @@ class MeshRouter {
         if (Buffer.compare(this.selfId, Buffer.from(peerHex, 'hex')) > 0) { link.close(); return; }
       }
     }
-    // Store-and-forward replay.
+    // Store-and-forward replay only for entries whose fixed deadline is still live.
     const peerId = Buffer.from(peerHex, 'hex');
+    const now = Date.now();
     for (const entry of this.relayStore.values()) {
-      if (entry.deliveredTo.has(peerHex)) continue;
+      if (entry.expiresAt <= now || entry.deliveredTo.has(peerHex)) continue;
       const dest = entry.packet.destination;
       const isForPeer = dest.equals(peerId), isBroadcast = dest.equals(R.BROADCAST_ID);
       const unknownDest = !isBroadcast && !this.peers.has(dest.toString('hex'));
@@ -131,9 +134,13 @@ class MeshRouter {
 
   onReceive(link, bytes, now = Date.now()) {
     let p; try { p = R.decode(bytes); } catch { return; }
-    if (Number(p.timestamp) > now + this.ttlMs) return;
+    const timestamp = Number(p.timestamp);
+    if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > now + this.futureSkewMs) return;
+    if (p.type === R.PacketType.ACK && (p.destination.equals(R.BROADCAST_ID) || p.payload.length !== 16)) return;
     const idHex = p.messageId.toString('hex');
-    if (this.seen.has(idHex)) return;
+    this._pruneSeen(now);
+    const relayEntry = this.relayStore.get(idHex);
+    if (this.seen.has(idHex) || (relayEntry && relayEntry.expiresAt > now)) return;
     this._markSeen(p, now);
     if (!this._rateAllows(p)) return;   // per-source broadcast flood cap (when configured)
 
@@ -181,7 +188,7 @@ class MeshRouter {
         } else text = p.payload.toString('utf8');
         this.delegate.deliver({ messageId: p.messageId, from: p.source, fromName: peer?.name, text, verified, broadcast, timestamp: p.timestamp });
         if (forMe) this.originate(R.buildPacket(this.identity, { type: R.PacketType.ACK, destination: p.source, payload: p.messageId }));
-      } else if (p.type === R.PacketType.ACK && forMe && p.payload.length === 16) {
+      } else if (p.type === R.PacketType.ACK && forMe && this._isExpectedAck(p, now)) {
         this.delegate.ack(p.payload);
       }
     }
@@ -189,6 +196,17 @@ class MeshRouter {
   }
 
   // ---- internals ----------------------------------------------------------
+
+  _isExpectedAck(ack, now) {
+    const original = this.relayStore.get(ack.payload.toString('hex'));
+    if (!original || original.expiresAt <= now) return false;
+    const message = original.packet;
+    return message.type === R.PacketType.MESSAGE &&
+      (message.flags & R.Flags.ENCRYPTED) !== 0 &&
+      message.source.equals(this.selfId) &&
+      !message.destination.equals(R.BROADCAST_ID) &&
+      message.destination.equals(ack.source);
+  }
 
   _relay(p, fromLink) {
     if (p.ttl <= 1) return;
@@ -216,7 +234,14 @@ class MeshRouter {
     while (this.relayStore.size > this.maxRelay) this.relayStore.delete(this.relayStore.keys().next().value);
   }
 
+  _pruneSeen(now) {
+    for (const [id, firstSeenAt] of this.seen) {
+      if (now >= firstSeenAt && now - firstSeenAt >= R.SEEN_TTL_MS) this.seen.delete(id);
+    }
+  }
+
   _markSeen(p, now = Date.now()) {
+    this._pruneSeen(now);
     this.seen.set(p.messageId.toString('hex'), now);
     while (this.seen.size > this.maxSeen) this.seen.delete(this.seen.keys().next().value);
   }
